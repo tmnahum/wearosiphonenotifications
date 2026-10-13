@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">Watch Test</string>
+    <string name="heading">Notification test</string>
+    <string name="intro">Send a sample message to your watch.</string>
+    <string name="send">Test notification</string>
+    <string name="clear">Clear test</string>
+    <string name="settings">Notification settings</string>
+    <string name="ready">Ready to send</string>
+    <string name="permission_needed">Tap Test notification to allow notifications.</string>
+    <string name="permission_denied">Notifications are off. Enable them in Notification settings, then try again.</string>
+    <string name="channel_blocked">The test channel is off. Enable it in Notification settings.</string>
+    <string name="posted">Sent at %1$s. Press the crown, then swipe up on the watch face.</string>
+    <string name="cleared">Test notification cleared</string>
+    <string name="channel_name">Test messages</string>
+    <string name="channel_description">Local sample messages for checking watch notifications.</string>
+    <string name="notification_title">Hello from Watch Test</string>
+    <string name="notification_body">Your watch can display notifications. This message was generated locally at %1$s. The next step is receiving messages from your iPhone.</string>
+</resources>
