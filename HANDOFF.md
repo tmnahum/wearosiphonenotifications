@@ -1,73 +1,83 @@
-# Pixel Watch / iPhone notification project handoff
+# Pixel Watch / iPhone notification bridge handoff
 
-Updated 2026-10-13. Read this before working in `/home/tmn/code/watch`.
+Updated 2026-10-13. Working directory `/home/tmn/code/watch`, branch `feature/ancs-chat-preview`, baseline `e1b79ea`. Implementation remains uncommitted. No remote or PR. No sub-agents used.
 
-## Current status and agreed next step
+## Standing device instruction
 
-**Local watch notification display is working. Bridge now works too, and the user confirmed the fix survives a restart. Do not restart the old notification-display investigation.**
+The user explicitly requested remembering to disable Bridge before ANCS work. See `AGENTS.md`: verify `com.orienlabs.bridge.wear` is disabled-user before connecting/testing our receiver; force-stop alone was insufficient. Keep it installed, preserve its bonds/data, and leave disabled unless the user requests switching back.
 
-We have not implemented Bluetooth or ANCS yet. The user wants a private alternative to Bridge for an **iPhone running iOS 18** and a **Pixel Watch 2 running Wear OS 5.1**. The watch was originally set up with an Android phone, now identified as a **Samsung Galaxy S10**, which the user still has. Bridge remains installed on watch and iPhone.
+## Goal and priorities
 
-Latest design decision: **implement real Bluetooth/ANCS reception before fancy conversation UI**. User specifically wants to learn what notification data iOS supplies, particularly for group chats, so the presentation is based on actual data. Next milestone is a small diagnostic receiver on the watch, not a polished messaging UI.
+Build a private direct iPhone → Pixel Watch notification relay with native expandable conversation previews when source data supports reliable grouping. User prioritizes Signal and iMessage, possibly Instagram later. Discord webhook testing is explicitly authorized by the user in chat; its secret must not be copied into this repository, documentation or logs.
 
-Project constraints: direct Bluetooth notification path if pairing/service access permits; no iPhone companion app required for that path, no cloud, analytics, accounts, or INTERNET permission in our app. These are goals, not claims that pairing or all desired features have already been proven.
+Devices: iPhone iOS 18, Pixel Watch 2 Wear OS 5.1 (API 35), originally configured using Galaxy S10. Bridge remains installed. No INTERNET permission, cloud, analytics or app notification-listener access.
 
-This turn only refreshes the handoff. No ANCS implementation has started. No PRs or sub-agents involved.
+## Pairing investigation
 
-## Next development steps
+At session start the user described two watch entries on iPhone. They now report it is back to **one**, with **Share System Notifications enabled**. A watch Bluetooth dump shows one bonded iPhone and Bluetooth clients registered for both Bridge and Watch Test. This does not establish what caused the temporary duplicate. Do not claim it was a second physical device or that a second bond was created. No new pairing, bond removal, Bluetooth reset or security-setting change was performed this session.
 
-1. Reconnect ADB using current mDNS discovery. At handoff refresh, `adb devices -l` and `adb mdns services` both returned empty lists; there is no currently confirmed endpoint. User may need to enable Wi-Fi/wireless debugging again.
-2. Inspect the existing project and the reference repository below. Preserve this workspace; do not replace it wholesale with the reference app.
-3. Investigate and implement the actual BLE pairing/bonding, GATT roles, ANCS service discovery, authorization, and subscription flow. Verify the required roles against reference code/specification rather than assuming that a simple BLE scan is sufficient. Add only the necessary Bluetooth permissions and runtime requests.
-4. Build a minimal on-watch diagnostic view for connection state and incoming notification fields. Keep data local and bounded. Use user-generated test messages; avoid dumping unrelated private notifications into chat, repository files, or broad logs.
-5. Inspect actual app identifier/display name, notification UID/event flags/category, title, subtitle, message body, date, and available action labels. Distinguish fields supplied by ANCS from anything inferred by our app.
-6. Test direct messages, group chats, two groups in the same app, multiple incoming messages, notification updates/removals, hidden previews, locked iPhone, and disconnect/reconnect. Record which fields reliably identify sender/conversation and which do not.
-7. Only then design grouping and MessagingStyle notifications. Keep notifications separate when grouping would be ambiguous. Handle reconnects and notification identity correctly; do not assume session notification UIDs are durable conversation IDs.
+The prior app could try `createBond()` after selecting an anonymous scan result. That fallback and BLE scanning have now been removed. The app lists all existing bonds, independent of device name, and connects only to the chosen bonded identity.
 
-User-supplied reference: https://github.com/k97/WearBridge . Only its README was reviewed previously; source has NOT been cloned/audited. README claims direct ANCS and testing on Pixel Watch 2 / Wear OS 5, but its iPhone test device uses iOS 26, not this user's iOS 18. Verify its implementation/license before reusing code.
+## Current implementation
 
-## Workspace and build
+- `AncsProtocol.kt`: valid 19-byte Get Notification Attributes request; only title/subtitle/message take length parameters. Fragmented UTF-8 tuple reassembly with bounds/header/order checks.
+- `AncsSession.kt`: pure Kotlin request state, bounded/coalesced queue (512), response retained across fragments; waits for both write acknowledgement and response; suppresses removed/superseded records. Connection teardown resets state.
+- `AncsBridgeService.kt`: main-looper GATT callbacks, stale-client checks, DS then NS subscription, serialized writes, connection/setup/response timeouts, write errors, explicit session teardown on service change, no automatic pairing. Transport disconnects/service changes now retry the selected bond with exponential backoff (2–60 seconds), cancelable via Disconnect; protocol errors do not auto-retry. No boot startup.
+- `AncsConversations.kt` now groups observed Discord channel/server labels and observed iMessage named-group subtitles into native MessagingStyle cards, with sender names and up to eight messages. 32-card bound, retaining newest notification timestamps rather than backlog arrival order; unrelated or unrecognized formats use individual BigTextStyle cards. UIDs identify message updates/removals; last removal cancels the card. Session ends clear relayed cards. Group keys are explicitly display-context heuristics, not real iOS thread IDs. Same-named group/server/channel collisions remain possible. Actual Discord thread separation requires a distinct visible context, not yet tested.
+- `AncsDiagnostics.kt`: six recent records in process memory, surviving Activity pause; cleared on session end. No fields in logs or on disk. Service `dumpsys activity service` exposes only counters/status.
+- `Conversation.kt`: existing normalized-message API and synthetic MessagingStyle demo. Synthetic normalized API remains separate from the live display-context grouping adapter. ANCS has no standard thread ID; do not claim these label keys are actual thread identifiers.
+- Activity now puts iPhone controls first; diagnostic fields are collapsed behind Show / hide details. It retains local diagnostics across pause/resume. Device buttons are not rebuilt on status changes, fixing the jumping UI.
 
-- App: **Watch Test**, package `dev.tmn.watchtest`.
-- Main source: `app/src/main/java/dev/tmn/watchtest/MainActivity.kt`.
-- Framework Activity with scrollable UI: Test notification, Clear test, notification settings, runtime POST_NOTIFICATIONS request.
-- AndroidX `NotificationCompat.Builder` and `BigTextStyle`, core 1.17.0; `android.useAndroidX=true`.
-- High-importance `test_messages` channel, vector small icon, title **Hello from Watch Test**, synthetic body, CATEGORY_MESSAGE, immutable content intent, auto-cancel, stable notification ID 1.
-- Default PRIVATE visibility. No `setLocalOnly` call. Current source and last installed APK match this configuration.
-- Manifest permissions currently only POST_NOTIFICATIONS and VIBRATE. No Bluetooth implementation or permissions yet.
-- Gradle wrapper 9.6.1, AGP 9.1.0 with built-in Kotlin, compileSdk 36, targetSdk 35, minSdk 33.
-- JDK: `/home/tmn/Apps/android-studio/jbr` (Java 25). SDK: `/home/tmn/Android/Sdk`.
+## Verification this session
+
+- Twenty-three JVM protocol/session/conversation tests pass (14 grouping tests plus 9 protocol tests), including every split boundary, one-byte fragments, multibyte UTF-8, high unsigned UID, exact request encoding, removal while in flight, superseding modification, response-before-write-callback, queue bounds and malformed responses.
+- `:app:testDebugUnitTest :app:assembleDebug :app:lintDebug` passed. Lint: 0 errors, 11 warnings (dependency versions, backup/task configuration, redundant API checks, unused strings).
+- Updated debug APK installed successfully using `adb install --no-streaming -r` after streamed installation stalled.
+- **Real ANCS reception and Android notification posting now verified through service counters**: after temporarily force-stopping Bridge and reconnecting, counters showed 286 events, 10 received/posted, with 55 queued and more processing. Actual tray confirmation for our card remains pending. A Discord-only grouping build produced four live conversation cards before a transport timeout. The latest build is installed. On the final retention build, privacy-filtered Android notification inspection verified four native Discord conversation cards (two multi-message, up to five messages) and two native iMessage conversation cards (one multi-message, up to four messages). The specific user-approved group was also earlier verified with MessagingStyle and group flag set. No personal message bodies or sender names were printed or persisted.
+- Discord synthetic webhook messages A1, A2, A3 sent successfully (HTTP 204). User confirmed Discord and the error status card appeared on watch. With Bridge running, our receiver failed with `Unexpected ANCS attribute 5; expected 1`. With Bridge temporarily force-stopped (`am force-stop com.orienlabs.bridge.wear`), then our app reconnected, reception/posts succeeded. Strong evidence of concurrent ANCS request interference. Bridge remains installed and paired but is now **disabled-user for exclusive ANCS testing** (`pm disable-user --user 0 com.orienlabs.bridge.wear`), after it repeatedly registered again following force-stop. Re-enable with `pm enable --user 0 com.orienlabs.bridge.wear`; do not run both receivers concurrently. Reopening it may restart the conflict. A3 was sent after successful standalone reception; asked user to confirm the Watch Test card. No private content printed or persisted.
+- Fixed jumping device UI: preserve buttons across status/field broadcasts, rebuilding only when bonded device list changes. Build/lint passed and fix installed. Do not repeatedly ask user to verify iPhone pairing: Bridge already works.
+
+## Direct iMessage chat update
+
+The user requested one-to-one iMessage grouping and asked whether grouping can generalize to all apps. Implemented a Messages-only sender-label rule when subtitle is empty and title/body are nonempty, excluding common generic app/summary titles. Direct-chat and group keys use separate rule namespaces, preventing a contact and same-named group from merging. Native MessagingStyle now uses the appropriate group flag. Added tests for repeated direct messages, separate senders, same-named group/contact isolation, and generic/unknown-app fallbacks. Build/lint and all 23 tests pass. The updated APK installed successfully. ADB stalled while reopening the app/receiver; manual connection and live direct-card verification are pending. Last IP transport failed to reconnect; mDNS transport was listed but its service query also stalled. Do not claim direct-card native verification yet.
+
+Explain: the bounded conversation store/rendering is shared across apps; each app needs a verified or explicitly best-effort identity rule. ANCS exposes display fields rather than iOS thread IDs. Same-name contacts, missing group context, unnamed groups, renamed chats, summaries and hidden previews can be ambiguous. No generic cross-app title grouping was enabled. Signal/other unverified layouts remain individual cards.
+
+## Latest conversation work
+
+- User confirmed the basic A3 relay card and requested per-conversation previews. Priorities remain Discord, iMessage and Signal.
+- Synthetic Discord D1/D2 sent with different webhook display names. Locally observed ANCS title pattern is FSI sender PDI (FSI #channel PDI, FSI server PDI), empty subtitle. Parser requires this exact isolated format to avoid punctuation-based accidental splits. No personal labels/message bodies copied into repo or chat.
+- User authorized inspecting an existing iMessage group. Content-free layout query verified app `com.apple.MobileSMS`, title=sender, subtitle=group, body does not start with title. Added generic named-group rule and tests with synthetic names; do not store user's actual group name in fixtures.
+- `dumpsys activity service ... layout LABEL` prints only field relationships. Up to 512 title/subtitle layout records are kept in memory, separate from six visible diagnostic records. No raw body content is stored in layout diagnostics.
+- Bridge was found registered again during reconnect errors; force-stop did not keep it inactive. Its watch package is now disabled-user for the test (reversible using `pm enable --user 0 com.orienlabs.bridge.wear`). It remains installed/paired; concurrent operation interferes with our ANCS responses.
+- Device had transient status 133 and status 8 transport failures; automatic retry against the selected existing bond added. Write-start failures also retry, with the status code surfaced. The next request is scheduled 100 ms after leaving a GATT callback. Fresh events are prioritized over pre-existing backlog. The paced-request build completed a 302-event backlog with 302 received, no pending requests, and the connection still ready. Long-run recovery behavior remains unverified; do not claim the transport is fully reliable.
+
+## Next steps
+
+1. User already confirmed basic A3 relay. Native conversation-card metadata is now verified for Discord and iMessage; ask user to inspect expansion/sender lines when convenient. Keep Bridge disabled for all ANCS device testing.
+2. User-authorized Discord webhook in chat has sent A1–A3 and D1–D4; D1/D3 used synthetic sender Alex and D2/D4 sender Sam. Avoid sending unnecessary repeats. Allow time for the iPhone to refresh. Do not print webhook secret or copy personal notification fields into chat/repo/logs.
+3. Verify actual card display, updates/removals, activity pause/resume and reconnect. Do not run Bridge and our direct ANCS receiver concurrently without solving shared response interference. Identify ours by Watch Test header.
+4. Continue visual verification and test updates/removals of native MessagingStyle cards for Discord and iMessage. Signal, Discord direct-message and additional Discord thread formats remain unverified and use individual cards. Obtain scoped examples before adding further rules.
+5. Improve connection resilience and app UI after successful end-to-end reception, without resetting bonds or disturbing the verified notification collector fix.
+
+## Build and device access
+
+Package `dev.tmn.watchtest`; Kotlin/AndroidX core 1.17.0; Gradle 9.6.1; AGP 9.1.0; compileSdk 36; target 35; min 33.
 
 ```bash
-JAVA_HOME=/home/tmn/Apps/android-studio/jbr ANDROID_HOME=/home/tmn/Android/Sdk ./gradlew :app:assembleDebug :app:lintDebug
-```
-
-APK: `app/build/outputs/apk/debug/app-debug.apk`.
-
-Last build/lint passed, zero errors and four warnings: AGP version, newer AndroidX dependency available, dataExtractionRules, Wear activity taskAffinity. No automated test suite yet; local display was tested on the physical watch. Meaningful parser/state-machine tests will be useful when ANCS is implemented.
-
-Workspace was not initialized as a Git repository during this work. README contains build/install instructions and a device-fix note. Its sentence saying reboot persistence is untested is now superseded by the user's confirmation in this handoff.
-
-## ADB and device operation
-
-ADB is not on PATH:
-```bash
+JAVA_HOME=/home/tmn/Apps/android-studio/jbr ANDROID_HOME=/home/tmn/Android/Sdk ./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
 /home/tmn/Android/Sdk/platform-tools/adb mdns services
-/home/tmn/Android/Sdk/platform-tools/adb connect WATCH_IP:CONNECTION_PORT
-/home/tmn/Android/Sdk/platform-tools/adb -s WATCH_IP:CONNECTION_PORT shell am start -n dev.tmn.watchtest/.MainActivity
+/home/tmn/Android/Sdk/platform-tools/adb -s 192.168.0.162:33141 install --no-streaming -r app/build/outputs/apk/debug/app-debug.apk
+/home/tmn/Android/Sdk/platform-tools/adb -s 192.168.0.162:33141 shell am start -n dev.tmn.watchtest/.MainActivity
+/home/tmn/Android/Sdk/platform-tools/adb -s 192.168.0.162:33141 shell dumpsys activity service dev.tmn.watchtest/.bridge.AncsBridgeService
 ```
 
-- Last successful endpoint: `192.168.0.162:40601`. Earlier port was 37547. Rediscover; do not assume either is still valid.
-- mDNS name: `adb-32281JEEJW01G0-VPWAI6._adb-tls-connect._tcp`.
-- Wireless debugging was successfully paired. Re-pair only if needed; connection port differs from pairing port.
-- ADB can list one watch by both IP and mDNS; always select it explicitly with `-s`.
-- API 35 / Android 15, 384×384 screen, product/device `r11btwifi`.
-- Host Wi-Fi: `malkin-nahum`, previously host IP `192.168.0.153`, host connected on 5 GHz. Same SSID provides 2.4 GHz for watch.
-- USB cable was tried but neither lsusb nor ADB detected the watch; do not assert the cable lacks data. Bluetooth debugging is unsupported on Wear OS 3+.
-- Use bounded command timeouts. Let an exec session finish before reading its screenshot; unfinished commands previously produced empty/missing images.
-- Watch frequently sleeps/relocks off-wrist/on charger. User was told Settings → Security → Screen lock → None disables locking but removes watch Wallet payment cards. Whether user actually changed it is unconfirmed. Do not change security settings via ADB. Stay awake is separate from pattern lock.
-- Automated gestures sometimes landed in Quick Settings, app drawer, or other apps. Verify each screen and coordinate with user to avoid competing touches. User opening the actual notification tray was useful.
-- Prior UI dump path: `/data/local/tmp/watchtest-ui.xml`. Prefer filtering text for our package/title rather than printing private cards.
+Last endpoint `192.168.0.162:33141` worked for installation. Rediscover if needed. ADB often lists the device while commands stall; transport disconnect/reconnect can help, no evidence establishes sleep as the cause. Use bounded timeouts and wait for command completion. Do not re-pair ADB unless actually needed. Watch is 384×384. Do not change lock/security settings. Avoid broad notification/logcat dumps, which may include personal content.
+
+Protocol sources:
+- https://developer.apple.com/library/archive/documentation/CoreBluetooth/Reference/AppleNotificationCenterServiceSpecification/Specification/Specification.html
+- https://developer.apple.com/library/archive/documentation/CoreBluetooth/Reference/AppleNotificationCenterServiceSpecification/Appendix/Appendix.html
+- https://developer.android.com/training/wearables/notifications
 
 ## Verified notification fix — preserve it
 
@@ -112,32 +122,3 @@ Diagnostics are under `/tmp/watchtest-debug/`, not guaranteed to survive cleanup
 Raw diagnostics may contain personal notification content. Do not copy them into the repo/handoff or repeatedly print unrelated content.
 
 **Earlier Gmail attribution remains unconfirmed.** Bridge had Gmail-tagged records, but the user thought the visible email belonged to the Android phone account. Native Gmail is installed too. The later confirmation that Bridge works does not establish the source of that earlier Gmail card.
-
-## Conversation notification discussion
-
-User observed that Android-forwarded chat notifications can expand into a conversation even without the source app installed on the watch. Explained that Wear OS supports native expandable `NotificationCompat.MessagingStyle` notifications containing multiple messages, sender names and timestamps.
-
-We can supply that presentation, but available iPhone data controls its usefulness. ANCS exposes notifications, not a full chat-history API or a general typed-reply transport. Do not promise full conversations, reliable group IDs, avatars, attachment retrieval, or arbitrary replies before verifying actual fields/capabilities. ANCS actions are predefined positive/negative actions with labels; do not assume their meanings.
-
-The standard ANCS specification scopes identifiers/data to a connection session and recommends discarding session state on disconnect. Review it before designing history retention/reconciliation; a persistent chat-history feature is not already agreed or implemented.
-
-User chose real ANCS investigation first rather than another synthetic UI prototype. Native notification header will generally show OUR app name, just as Bridge shows Bridge; replacing the system app label requires privileged permission, unavailable to ordinary apps. Original source app can be identified within content we control.
-
-Useful primary sources:
-- ANCS specification: https://developer.apple.com/library/archive/documentation/CoreBluetooth/Reference/AppleNotificationCenterServiceSpecification/Specification/Specification.html
-- Wear notifications / MessagingStyle: https://developer.android.com/training/wearables/notifications
-- Android conversations: https://developer.android.com/develop/ui/views/notifications/conversations
-- App-name substitution permission: https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android15-release/core/res/AndroidManifest.xml (`SUBSTITUTE_NOTIFICATION_APP_NAME`, signature|privileged).
-
-## Side topic: Gemini (advice only, no installation performed)
-
-User asked about replacing watch Google Assistant with Gemini. Pixel Watch 2 / Wear OS 5.1 meets Gemini's Wear OS 4+ requirement. Official setup requires a connected Android phone with Gemini selected as digital assistant, eligible account/region/language, and current watch apps. Suggested using the original Galaxy S10: update Google app, install/open Gemini and select it, reconnect watch, update Assistant/Gemini on watch, finish setup.
-
-S10 meets published Gemini phone requirements (Android 9+, 2 GB RAM). Do not claim setup was performed or Gemini works independently with the user's iPhone. Proposed testing watch Wi-Fi operation after disconnecting Android; not done.
-
-Sources:
-- https://support.google.com/gemini/answer/16401122?hl=en
-- https://support.google.com/googlepixelwatch/answer/16393978?hl=en
-- https://support.google.com/gemini/answer/14579026?hl=en
-
-Keep the next session focused on the requested ANCS milestone unless the user steers back to Gemini.

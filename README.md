@@ -1,6 +1,22 @@
 # Watch Test
 
-A small standalone Kotlin Wear OS app for testing native watch notifications before adding iPhone ANCS support. Minimum Android API 33; target API 35 (Wear OS 5.1).
+A standalone Kotlin Wear OS app for direct iPhone notification reception over ANCS, with a session-scoped conversation preview API. Minimum Android API 33; target API 35 (Wear OS 5.1).
+
+## Conversation previews
+
+`bridge/Conversation.kt` accepts normalized messages with a source app and an explicit conversation ID, bounds each preview to eight messages and each session to 32 conversations, and renders them with AndroidX `MessagingStyle`. The caller must clear previews when its ANCS session ends. Since ANCS does not provide a thread ID, the adapter must leave `conversationId` unset until an app-specific identity is verified; ambiguous messages should stay separate.
+
+Use **Group preview sample** in the app to post a local three-message conversation to the watch. This is synthetic UI data and does not represent a live iPhone notification.
+
+`bridge/AncsProtocol.kt` parses events, encodes requests and reassembles fragmented responses. `AncsSession.kt` serializes bounded requests, waits for both write acknowledgement and response completion, and suppresses removed or superseded results. `AncsBridgeService` connects only to an existing bond, subscribes to Data Source before Notification Source, and posts received notifications as individual expandable watch cards. Notifications are updated/removed by their session UID. Live Discord channel previews use the observed sender + channel + server labels; named iMessage group previews use the observed title=sender, subtitle=group layout. Messages notifications with a sender title and no group subtitle use a separate direct-chat key and native one-to-one MessagingStyle. Both use native MessagingStyle. They are best-effort display-context groups, not true iOS thread IDs. Generic Messages app/summary titles are excluded. Direct-chat keys are inferred from visible sender labels, so identical contact names or missing group context can be ambiguous. Other formats remain individual cards until verified.
+
+Choose **Choose paired iPhone**, then the iPhone entry. Enable **Share System Notifications** for the watch in iPhone Bluetooth settings. The app never creates a bond. Disconnects and service changes end the session. Transport disconnects retry the selected bond with increasing delays; Disconnect cancels retries. Protocol errors still require manual reconnect. Reboot startup is not implemented. Run only one direct ANCS receiver at a time. Bridge must be disabled before device testing (`adb -s ENDPOINT shell pm disable-user --user 0 com.orienlabs.bridge.wear`); force-stop alone did not keep it inactive. See `AGENTS.md` for the standing instruction and reversal command. Both apps running together produced mismatched ANCS responses.
+
+Diagnostics retain six recent records in process memory while the activity is paused. Session data and relayed cards are cleared when the session ends. The service's ADB dump exposes counters and connection status only, never notification contents.
+
+`AncsConversations.kt` maintains up to 32 cards by notification timestamp, with eight messages per conversation. Older backlog records cannot evict newer chats. Different notification UIDs preserve identical repeated messages; updates replace the same UID; removals update or cancel the associated conversation card. A reconnect clears the session. Discord channel/server label collisions cannot be distinguished over ANCS; actual Discord threads are separate only if the supplied context distinguishes them. Signal, Discord direct-message and other thread formats still need verified device examples; their notifications remain individual cards.
+
+The event queue holds up to 512 pending UIDs to handle initial iPhone backlogs. Content-free layout diagnostics can be requested using `dumpsys activity service dev.tmn.watchtest/.bridge.AncsBridgeService layout CONVERSATION_LABEL`; output describes field relationships, not names or message bodies. Up to 512 title/subtitle layout records stay in session memory, with six detailed records shown in the app.
 
 ## Build
 
@@ -11,7 +27,7 @@ On this workstation:
 ```bash
 export JAVA_HOME=/home/tmn/Apps/android-studio/jbr
 export ANDROID_HOME=/home/tmn/Android/Sdk
-./gradlew :app:assembleDebug :app:lintDebug
+./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
 ```
 
 APK: `app/build/outputs/apk/debug/app-debug.apk`.
@@ -47,10 +63,10 @@ On this Pixel Watch 2, local notifications were posted successfully but absent f
 adb -s WATCH_IP:CONNECTION_PORT shell cmd notification allow_listener com.google.wear.services/com.google.wear.services.notification.stream.listener.NotificationCollectorService 0
 ```
 
-This is a device repair for the observed missing permission, not an app installation step to apply universally. It preserves other listener approvals. Both the existing card and a freshly posted card were verified in the real tray, and the user confirmed display. The app retains default private visibility and uses AndroidX NotificationCompat. Persistence across another reboot remains untested.
+This is a device repair for the observed missing permission, not an app installation step to apply universally. It preserves other listener approvals. Both the existing card and a freshly posted card were verified in the real tray, and the user confirmed display. The app retains default private visibility and uses AndroidX NotificationCompat. The user confirmed that the display fix survives a reboot and also restores Bridge notifications.
 
 Do not infer visibility from `dumpsys notification` counters: this device continued reporting zero airtime even while the card was visibly displayed. See `HANDOFF.md` for the investigation and diagnostic locations.
 
 ## Privacy and scope
 
-Only notification and vibration permissions are declared. No internet access, Bluetooth connection, health access, analytics, server, or notification-listener access. All message text is generated locally. This milestone verifies local display; it does not receive iPhone notifications yet.
+The app uses Bluetooth connect, notification, vibration and connected-device foreground service permissions. No INTERNET permission, cloud, analytics, or notification-listener access. Notification text remains in memory and in local Android notification cards; the app does not log or persist it. Synthetic samples remain separate from live reception.
