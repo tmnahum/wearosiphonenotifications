@@ -12,9 +12,17 @@ Keep the competing Bridge package disabled during ANCS work; see `AGENTS.md`. Fo
 
 The foreground-service notification is a static, silent, low-importance card posted once per service instance. Connection changes update the app, not that card. Wear OS still decides notification ordering.
 
+## App controls
+
+**Apps & delivery** lists every observed source app, including apps recovered from existing history. Display names are fetched from the iPhone over ANCS and cached locally. Select an app to choose Normal, Silent (LOW-importance channel), or Muted delivery, and Automatic, One thread per app, or Separate grouping. Changes preserve saved messages and refresh current cards silently. Muting hides native notifications; the local history and 14-day log still collect them. App preferences survive clearing messages.
+
+Automatic grouping uses Messages, Discord and Signal-specific visible layouts first. Signal supports visible chat titles, sender-prefixed group bodies, group subtitles and the English sender-in-group title. The default for other apps matches exact title and subtitle, excluding generic/hidden summary labels. These are heuristics rather than true conversation identifiers. Select Separate when labels are ambiguous, or One thread per app for an inbox such as Gmail.
+
+Connection screens distinguish Bluetooth setup from fully subscribed notification delivery and automatic retries. Explicit Disconnect stays off; reopening an enabled app or sticky service recreation reconnects the saved phone. Boot startup is still not implemented.
+
 ## Conversation previews and storage
 
-- Messages direct chats use the sender display label; named groups use the subtitle. Discord channels use the observed isolated channel/server labels. These are best-effort display-context keys, not iOS thread IDs. Identical names, hidden previews, renamed chats and unverified layouts can be ambiguous. Signal and other unverified formats remain individual cards.
+- Messages direct chats use the sender display label; named groups use the subtitle. Discord channels use the observed isolated channel/server labels. These are best-effort display-context keys, not iOS thread IDs. Identical names, hidden previews, renamed chats and unverified layouts can be ambiguous. Signal and generic fallbacks are described above; ambiguous labels can still collide.
 - Local conversation history has **no message-count or conversation-count cap**. Native MessagingStyle cards include the most recent 25 messages, Android's notification-container capacity. The app pages the conversation list and message views. Android also limits outstanding app notifications: when the tray is full, older visible relay cards make room for newer ones without deleting their saved history.
 - `NotificationHistory` assigns durable local IDs. ANCS UIDs only map to them for the current Bluetooth session. On reconnect, pre-existing notifications with a valid posted date match saved app/title/subtitle/body/date fields within the same phone. Matching consumes occurrences one-for-one. Live duplicate messages remain distinct. Missing dates are not guessed; edits made while disconnected can produce a second record.
 - `HistoryRepository` restores off the UI thread and saves a versioned AtomicFile on a serial worker. Updates coalesce over 750 ms; orderly session teardown flushes. An abrupt process kill can lose the latest unflushed updates. No cloud backup.
@@ -28,7 +36,7 @@ Both storage files live in app-private `noBackupFilesDir`; backup is disabled. N
 
 `AncsProtocol.kt` validates events, request encoding and fragmented responses. `AncsSession.kt` serializes requests, handles write/response ordering, suppresses removed/superseded requests and prioritizes fresh events over backlog. The queue remains bounded at 512 pending UIDs; this is transport backpressure, not a history retention cap.
 
-38 JVM tests cover protocol/session handling, grouping, restart/reconnect merging, repeated identical messages, source isolation, edits, watch-vs-phone dismissal, retention beyond the old limits, codec corruption and the 14-day cutoff. Build and lint are required before installation. Real watch ranking, swipe dismissal and long-run reconnects require device verification.
+49 JVM tests cover protocol/session handling, grouping, restart/reconnect merging, repeated identical messages, source isolation, edits, watch-vs-phone dismissal, retention beyond the old limits, codec corruption and the 14-day cutoff. Build and lint are required before installation. Real watch ranking, swipe dismissal and long-run reconnects require device verification.
 
 ## Build
 

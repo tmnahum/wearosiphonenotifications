@@ -1,5 +1,6 @@
 package dev.tmn.watchtest.bridge
 
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.os.Handler
@@ -8,14 +9,17 @@ import android.util.AtomicFile
 import java.io.File
 import java.util.concurrent.Executors
 
-/** One main-thread model shared by service and UI; all file I/O runs on a serial worker. */
-@android.annotation.SuppressLint("StaticFieldLeak") // Application context only; process-scoped repository.
+/** Shared main-thread state; file I/O and restoration run on one serial worker. */
+@android.annotation.SuppressLint("StaticFieldLeak") // Application context, never an Activity.
 class HistoryRepository private constructor(context: Context) {
     private val app = context.applicationContext
     private val file = AtomicFile(File(app.noBackupFilesDir, "notification-history-v1.bin"))
+    private val appFile = AtomicFile(File(app.noBackupFilesDir, "source-apps-v1.bin"))
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
-    var history = NotificationHistory()
+    var catalog = AppCatalog()
+        private set
+    var history = NotificationHistory(catalog)
         private set
     private val log by lazy { NotificationLog(File(app.noBackupFilesDir, "notification-log-v1.db")) }
     var logError: String? = null
@@ -24,42 +28,78 @@ class HistoryRepository private constructor(context: Context) {
         private set
     var error: String? = null
         private set
+    private var historyReadFailed = false
+    private var catalogReadFailed = false
     private val waiting = mutableListOf<() -> Unit>()
     private val saveTask = Runnable { saveNow() }
     private val maintenance = object : Runnable {
-        override fun run() {
-            pruneLog()
-            main.postDelayed(this, 3_600_000)
-        }
+        override fun run() { pruneLog(); main.postDelayed(this, 3_600_000) }
     }
-
+    private fun exists(file: AtomicFile) = file.baseFile.exists() || File(file.baseFile.path + ".bak").exists()
     init {
         main.postDelayed(maintenance, 3_600_000)
         worker.execute {
+            val appsResult = runCatching { if (exists(appFile)) appFile.openRead().use(AppCatalogCodec::read) else emptyList() }
+            val restoredCatalog = AppCatalog().apply { restore(appsResult.getOrDefault(emptyList())) }
             val result = runCatching {
-                if (file.baseFile.exists() || File(file.baseFile.path + ".bak").exists())
-                    file.openRead().use(HistoryCodec::read) else SavedHistory(emptyList(), emptySet())
+                if (exists(file)) file.openRead().use(HistoryCodec::read) else SavedHistory(emptyList(), emptySet())
             }.mapCatching { saved ->
-                NotificationHistory().apply { restore(saved.records, saved.dismissed) }
+                // Migrate existing installations: every previously observed app appears in Settings.
+                saved.records.forEach { restoredCatalog.observe(it.fields[0].orEmpty(), it.receivedAt.toEpochMilli()) }
+                NotificationHistory(restoredCatalog).apply { restore(saved.records, saved.dismissed) }
             }
             main.post {
-                result.fold(onSuccess = { restored -> history = restored }, onFailure = {
-                    error = "Saved history could not be read. New messages will start a fresh history."
-                })
+                catalog = restoredCatalog
+                history = result.getOrElse { NotificationHistory(catalog) }
+                historyReadFailed = result.isFailure
+                catalogReadFailed = appsResult.isFailure
                 loaded = true
-                val callbacks = waiting.toList()
-                waiting.clear()
-                callbacks.forEach { it() }
+                updateReadError()
+                val callbacks = waiting.toList(); waiting.clear(); callbacks.forEach { it() }
                 broadcast()
+                changed() // Persist app discovery/migration, preserving any unreadable original file.
             }
             accessLog { prune(System.currentTimeMillis(), force = true) }
         }
     }
+    private fun updateReadError() {
+        error = when {
+            historyReadFailed -> "Saved history couldn't be read. It has been preserved; new previews are temporary until local data is cleared."
+            catalogReadFailed -> "App settings couldn't be read. The original settings file has been preserved."
+            else -> null
+        }
+    }
     fun whenReady(action: () -> Unit) { if (loaded) action() else waiting.add(action) }
     fun recordNotification(event: AncsProtocol.Event, fields: Map<Int, String>) {
-        val copy = fields.toMap()
-        val now = System.currentTimeMillis()
+        val copy = fields.toMap(); val now = System.currentTimeMillis()
+        catalog.observe(fields[0].orEmpty(), now)
         worker.execute { accessLog { append(event, copy, now) } }
+    }
+    fun appNameReceived(id: String, name: String) {
+        if (name.isBlank()) return
+        catalog.name(id, name)
+        val old = history.snapshot().filter { it.app == id }.map { it.tag }.toSet()
+        val changes = history.regroup()
+        changes.removed.filter { it in old }.forEach { app.getSystemService(NotificationManager::class.java).cancel(it, 0) }
+        changed(); appsChanged(id)
+    }
+    fun updateApp(id: String, settings: AppSettings) {
+        check(loaded)
+        // Cancel old grouping/muted cards immediately; receiver redraws current live cards silently.
+        history.snapshot().filter { it.app == id }.forEach { app.getSystemService(NotificationManager::class.java).cancel(it.tag, 0) }
+        catalog.settings(id, settings)
+        history.regroup()
+        changed(); flush(); appsChanged(id)
+    }
+    private fun appsChanged(id: String) {
+        app.sendBroadcast(Intent(EVENT_APPS).setPackage(app.packageName).putExtra("app", id))
+    }
+    fun clearLocalData() {
+        history.snapshot().forEach { app.getSystemService(NotificationManager::class.java).cancel(it.tag, 0) }
+        history.clear()
+        historyReadFailed = false // Explicit user clearing authorizes replacing an unreadable history.
+        updateReadError()
+        clearLog(); changed(); flush()
     }
     fun clearLog() { worker.execute { accessLog { clear() } } }
     fun pruneLog() { worker.execute { accessLog { prune(System.currentTimeMillis()) } } }
@@ -71,30 +111,31 @@ class HistoryRepository private constructor(context: Context) {
         }
     }
     fun changed() {
-        if (!main.hasCallbacks(saveTask)) main.postDelayed(saveTask, 750)
+        if (loaded && !main.hasCallbacks(saveTask)) main.postDelayed(saveTask, 750)
         broadcast()
     }
     fun flush(onComplete: (() -> Unit)? = null) {
         main.removeCallbacks(saveTask)
-        if (loaded) saveNow(onComplete) else onComplete?.invoke()
+        if (loaded) saveNow(onComplete) else whenReady { saveNow(onComplete) }
+    }
+    private fun atomicWrite(file: AtomicFile, write: (java.io.OutputStream) -> Unit) {
+        val stream = file.startWrite()
+        try { write(stream); file.finishWrite(stream) }
+        catch (error: Exception) { file.failWrite(stream); throw error }
     }
     private fun saveNow(onComplete: (() -> Unit)? = null) {
-        val snapshot = history.saved()
-        val dismissed = history.dismissed()
+        val snapshot = history.saved(); val dismissed = history.dismissed(); val apps = catalog.all()
+        val writeHistory = !historyReadFailed; val writeApps = !catalogReadFailed
         worker.execute {
             val result = runCatching {
-                val stream = file.startWrite()
-                try {
-                    HistoryCodec.write(stream, snapshot, dismissed)
-                    file.finishWrite(stream)
-                } catch (error: Exception) {
-                    file.failWrite(stream)
-                    throw error
-                }
+                if (writeHistory) atomicWrite(file) { HistoryCodec.write(it, snapshot, dismissed) }
+                if (writeApps) atomicWrite(appFile) { AppCatalogCodec.write(it, apps) }
             }
             main.post {
-                val newError = if (result.isFailure) "Could not save history on this watch. Recent messages may be lost on restart." else null
-                if (error != newError) { error = newError; broadcast() }
+                val previous = error
+                updateReadError()
+                if (result.isFailure) error = "Local changes could not be saved. Check free storage on the watch."
+                if (error != previous) broadcast()
                 onComplete?.invoke()
             }
         }
@@ -102,6 +143,7 @@ class HistoryRepository private constructor(context: Context) {
     private fun broadcast() { app.sendBroadcast(Intent(EVENT_HISTORY).setPackage(app.packageName)) }
     companion object {
         const val EVENT_HISTORY = "dev.tmn.watchtest.HISTORY"
+        const val EVENT_APPS = "dev.tmn.watchtest.APPS"
         private var instance: HistoryRepository? = null
         fun get(context: Context): HistoryRepository = instance ?: HistoryRepository(context).also { instance = it }
     }

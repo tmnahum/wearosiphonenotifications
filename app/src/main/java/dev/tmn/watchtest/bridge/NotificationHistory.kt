@@ -11,8 +11,8 @@ import java.time.format.DateTimeFormatter
 /** Local IDs are durable. Remote UIDs are never persisted or reused across ANCS sessions. */
 data class SavedNotification(val id: Long, val source: String, val fields: Map<Int, String>, val receivedAt: Instant)
 
-class NotificationHistory {
-    private val store = AncsConversationStore()
+class NotificationHistory(private val catalog: AppCatalog = AppCatalog()) {
+    private val store = AncsConversationStore(appSettings = { catalog.get(it).settings }, appName = { catalog.get(it).name })
     private val records = linkedMapOf<Long, SavedNotification>()
     private val remoteIds = mutableMapOf<Long, Long>()
     private val replayCandidates = linkedSetOf<Long>()
@@ -23,6 +23,10 @@ class NotificationHistory {
     val cardCount get() = store.cardCount
     val conversationCount get() = store.conversationCount
     fun snapshot() = store.snapshot()
+    fun activeSnapshot(): List<AncsCard> {
+        val ids = remoteIds.values.toSet()
+        return snapshot().filter { card -> card.messages.any { it.uid in ids } }
+    }
     fun saved() = records.values.toList()
     fun dismissed() = clearedFingerprints.toSet()
 
@@ -53,7 +57,8 @@ class NotificationHistory {
         val previous = records[id]
         val saved = SavedNotification(id, source, fields.filterKeys { it in 0..5 }.toMap(), previous?.receivedAt ?: now)
         records[id] = saved
-        val changes = store.upsert(event.copy(uid = id), fields, saved.receivedAt, source)
+        val stableTime = previous?.takeIf { it.fields[5].orEmpty() == fields[5].orEmpty() }?.receivedAt
+        val changes = store.upsert(event.copy(uid = id), fields, saved.receivedAt, source, timestampOverride = stableTime)
         snapshot().flatMap { it.messages }.firstOrNull { it.uid == id }?.let {
             records[id] = saved.copy(receivedAt = it.timestamp)
         }
@@ -82,11 +87,23 @@ class NotificationHistory {
         saved.forEach { record ->
             require(record.id in 1 until Long.MAX_VALUE)
             records[record.id] = record
-            store.upsert(AncsProtocol.Event(0, 0, 0, 0, record.id), record.fields, record.receivedAt, record.source, trackChanges = false)
+            store.upsert(AncsProtocol.Event(0, 0, 0, 0, record.id), record.fields, record.receivedAt, record.source, trackChanges = false, timestampOverride = record.receivedAt)
             nextId = maxOf(nextId, record.id + 1)
         }
         prune()
     }
+    /** Rebuild display keys without losing transient UID mappings or replay occurrence counts. */
+    fun regroup(): AncsCardChanges {
+        val before = snapshot().map { it.tag }.toSet()
+        store.clear()
+        records.values.forEach { record ->
+            store.upsert(AncsProtocol.Event(0, 0, 0, 0, record.id), record.fields, record.receivedAt,
+                record.source, trackChanges = false, timestampOverride = record.receivedAt)
+        }
+        val after = snapshot()
+        return AncsCardChanges(after, before - after.map { it.tag }.toSet())
+    }
+
     fun clearConversation(tag: String): AncsCardChanges {
         val ids = snapshot().firstOrNull { it.tag == tag }?.messages?.map { it.uid }?.toSet()
             ?: return AncsCardChanges(emptyList(), emptySet())

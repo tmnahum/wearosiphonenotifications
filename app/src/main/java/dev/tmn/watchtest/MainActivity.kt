@@ -26,6 +26,9 @@ import dev.tmn.watchtest.bridge.AncsCard
 import dev.tmn.watchtest.bridge.AncsConversationRules
 import dev.tmn.watchtest.bridge.AncsDiagnostics
 import dev.tmn.watchtest.bridge.HistoryRepository
+import dev.tmn.watchtest.bridge.ConnectionPhase
+import dev.tmn.watchtest.bridge.Delivery
+import dev.tmn.watchtest.bridge.Grouping
 import java.text.DateFormat
 import java.util.Date
 
@@ -37,6 +40,12 @@ class MainActivity : Activity() {
     private lateinit var content: LinearLayout
     private var statusView: TextView? = null
     private var connectionButton: Button? = null
+    private var connectionAction: Button? = null
+    private var appsList: LinearLayout? = null
+    private var appsRevision = -1L
+    private var renderedCatalogRevision = -1L
+    private var selectedApp: String? = null
+    private var appPageSize = 20
     private var historyList: LinearLayout? = null
     private var renderedCards: List<AncsCard>? = null
     private var renderedHistoryLoaded = false
@@ -46,6 +55,7 @@ class MainActivity : Activity() {
     private var selectedTag: String? = null
     private var permissionAction: (() -> Unit)? = null
     private var registered = false
+    private var resumed = false
     private val accent = Color.rgb(130, 230, 205)
     private val muted = Color.rgb(177, 186, 194)
 
@@ -53,22 +63,31 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT) { navigateBack() }
         showHome()
-        repository.whenReady { if (!isDestroyed) refresh() }
+        repository.whenReady {
+            if (!isDestroyed) {
+                resumeEnabledConnection()
+                refresh()
+            }
+        }
     }
     override fun onResume() {
         super.onResume()
+        resumed = true
+        resumeEnabledConnection()
         repository.pruneLog()
         if (!registered) {
             registerReceiver(receiver, IntentFilter().apply {
                 addAction(AncsBridgeService.EVENT_STATE)
                 addAction(AncsBridgeService.EVENT_FIELDS)
                 addAction(HistoryRepository.EVENT_HISTORY)
+                addAction(HistoryRepository.EVENT_APPS)
             }, RECEIVER_NOT_EXPORTED)
             registered = true
         }
         refresh()
     }
     override fun onPause() {
+        resumed = false
         if (registered) { unregisterReceiver(receiver); registered = false }
         super.onPause()
     }
@@ -80,6 +99,9 @@ class MainActivity : Activity() {
         screen = name
         statusView = null
         connectionButton = null
+        connectionAction = null
+        appsList = null
+        appsRevision = -1
         historyList = null
         renderedCards = null
         content = LinearLayout(this).apply {
@@ -124,9 +146,10 @@ class MainActivity : Activity() {
     private fun showHome() {
         page("home", getString(R.string.app_name))
         statusView = label("", 13f, accent).apply { minLines = 2 }
-        connectionButton = button(if (AncsDiagnostics.running) "Connection" else "Connect iPhone", primary = true) {
-            if (AncsDiagnostics.running) showConnection() else connectSaved()
+        connectionButton = button("Connect iPhone", primary = true) {
+            if (AncsDiagnostics.phase == ConnectionPhase.DISCONNECTED) connectSaved() else showConnection()
         }
+        button("Apps & delivery") { showApps() }
         label("Recent conversations", 16f, Color.WHITE, bold = true)
         historyList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -138,20 +161,22 @@ class MainActivity : Activity() {
     private fun refresh() {
         when (screen) {
             "home" -> {
-                connectionButton?.text = if (AncsDiagnostics.running) "Connection" else "Connect iPhone"
-                statusView?.text = when {
-                    !notifications.areNotificationsEnabled() -> "Notifications are off · Enable in Settings"
-                    repository.error != null -> repository.error
-                    AncsDiagnostics.problem -> "Connection needs attention"
-                    AncsDiagnostics.problem -> AncsDiagnostics.status
-        AncsDiagnostics.connected -> "Connected to iPhone"
-                    AncsDiagnostics.running -> "Connecting · Saved chats available"
-                    else -> "Offline · Saved chats available"
+                connectionButton?.text = when (AncsDiagnostics.phase) {
+                    ConnectionPhase.DISCONNECTED -> "Connect iPhone"
+                    ConnectionPhase.ERROR -> "Fix connection"
+                    else -> "Connection settings"
+                }
+                statusView?.text = AncsDiagnostics.phase.title + when {
+                    !notifications.areNotificationsEnabled() -> "\nWatch notifications are disabled"
+                    repository.error != null -> "\nLocal storage needs attention"
+                    AncsDiagnostics.phase == ConnectionPhase.CONNECTED -> "\nNotifications are enabled"
+                    else -> "\n" + AncsDiagnostics.phase.detail
                 }
                 val cards = repository.history.snapshot().sortedByDescending { it.messages.last().timestamp }
-                if (renderedCards == cards && renderedHistoryLoaded == repository.loaded) return
+                if (renderedCards == cards && renderedHistoryLoaded == repository.loaded && renderedCatalogRevision == repository.catalog.revision) return
                 renderedCards = cards
                 renderedHistoryLoaded = repository.loaded
+                renderedCatalogRevision = repository.catalog.revision
                 historyList?.let { list ->
                     list.removeAllViews()
                     if (cards.isEmpty()) label(if (repository.loaded) "Messages will appear here when your iPhone sends notifications." else "Loading saved conversations…", parent = list)
@@ -171,7 +196,16 @@ class MainActivity : Activity() {
                     }
                 }
             }
-            "connection" -> statusView?.text = connectionText()
+            "connection" -> {
+                statusView?.text = connectionText()
+                connectionAction?.text = when (AncsDiagnostics.phase) {
+                    ConnectionPhase.CONNECTED -> "Disconnect"
+                    ConnectionPhase.DISCONNECTED -> "Connect"
+                    ConnectionPhase.ERROR -> "Try again"
+                    else -> "Cancel connection"
+                }
+            }
+            "apps" -> refreshApps()
             "diagnostics" -> statusView?.text = diagnosticsText()
             // Do not jump back to the top while someone reads a conversation. The newest
             // snapshot appears on next open, with an explicit refresh action in the thread.
@@ -207,24 +241,85 @@ class MainActivity : Activity() {
     private fun showConnection() {
         page("connection", "Connection")
         statusView = label(connectionText(), color = accent)
-        button("Reconnect", primary = true) { connectSaved() }
-        button("Choose paired phone") { withPermissions { showPhones() } }
-        button("Disconnect") {
-            startBridge(AncsBridgeService.ACTION_DISCONNECT)
-            showHome()
+        connectionAction = button("Connect", primary = true) {
+            when (AncsDiagnostics.phase) {
+                ConnectionPhase.DISCONNECTED, ConnectionPhase.ERROR -> connectSaved()
+                else -> startBridge(AncsBridgeService.ACTION_DISCONNECT)
+            }
         }
+        button("Choose paired iPhone") { withPermissions { showPhones() } }
+        refresh()
         label("On your iPhone, enable Share System Notifications in this watch’s Bluetooth settings.")
         button("Back") { showHome() }
     }
-    private fun connectionText() = when {
-        AncsDiagnostics.problem -> AncsDiagnostics.status
-        AncsDiagnostics.connected -> "Connected\nNew notifications arrive automatically."
-        AncsDiagnostics.running -> "Connecting…\n${AncsDiagnostics.status}"
-        else -> "Disconnected\nYour saved conversations are still available."
+    private fun connectionText(): String {
+        val phase = AncsDiagnostics.phase
+        val detail = if (phase == ConnectionPhase.ERROR) AncsDiagnostics.status else phase.detail
+        return "${phase.title}\n$detail"
+    }
+    private fun showApps() {
+        page("apps", "Apps & delivery")
+        label("Every app seen on your iPhone appears here.")
+        appsList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            content.addView(this, LinearLayout.LayoutParams(-1, -2))
+        }
+        button("Back") { showHome() }
+        refreshApps()
+    }
+    private fun refreshApps() {
+        if (!repository.loaded) {
+            appsList?.let { it.removeAllViews(); label("Loading app settings…", parent = it) }
+            return
+        }
+        if (appsRevision == repository.catalog.revision) return
+        appsRevision = repository.catalog.revision
+        val list = appsList ?: return
+        list.removeAllViews()
+        val apps = repository.catalog.all().sortedBy { it.name.lowercase() }
+        if (apps.isEmpty()) label("Apps appear after their first notification arrives.", parent = list)
+        apps.take(appPageSize).forEach { app ->
+            val delivery = when (app.settings.delivery) { Delivery.NORMAL -> "Normal"; Delivery.SILENT -> "Silent"; Delivery.MUTED -> "Muted" }
+            button("${app.name} · $delivery", parent = list) { selectedApp = app.id; showAppSettings() }
+        }
+        if (apps.size > appPageSize) button("More apps", parent = list) { appPageSize += 20; appsRevision = -1; refreshApps() }
+    }
+    private fun showAppSettings() {
+        val id = selectedApp ?: return showApps()
+        val app = repository.catalog.get(id)
+        page("appSettings", app.name)
+        val deliveryLabels = arrayOf("Normal", "Silent", "Muted")
+        button("Delivery: ${deliveryLabels[app.settings.delivery.ordinal]}") {
+            AlertDialog.Builder(this).setTitle("Delivery")
+                .setSingleChoiceItems(deliveryLabels, app.settings.delivery.ordinal) { dialog, which ->
+                    repository.updateApp(id, repository.catalog.get(id).settings.copy(delivery = Delivery.entries[which]))
+                    dialog.dismiss(); showAppSettings()
+                }.setNegativeButton("Cancel", null).show()
+        }
+        label(when (app.settings.delivery) {
+            Delivery.NORMAL -> "Show notifications with your watch’s normal alerts."
+            Delivery.SILENT -> "Show notifications without sound or vibration."
+            Delivery.MUTED -> "Hide this app’s watch notifications. Local history and log are still kept."
+        })
+        val groupingLabels = arrayOf("Automatic", "One thread per app", "Separate notifications")
+        button("Grouping: ${groupingLabels[app.settings.grouping.ordinal]}") {
+            AlertDialog.Builder(this).setTitle("Grouping")
+                .setSingleChoiceItems(groupingLabels, app.settings.grouping.ordinal) { dialog, which ->
+                    repository.updateApp(id, repository.catalog.get(id).settings.copy(grouping = Grouping.entries[which]))
+                    dialog.dismiss(); showAppSettings()
+                }.setNegativeButton("Cancel", null).show()
+        }
+        label(when (app.settings.grouping) {
+            Grouping.AUTOMATIC -> "Use chat context when available. Other notifications group by matching title and subtitle."
+            Grouping.APP -> "Combine everything from ${app.name} into one preview."
+            Grouping.SEPARATE -> "Keep each notification as its own card."
+        })
+        button("Back") { showApps() }
     }
     private fun showSettings() {
         page("settings", "Settings")
         button("Connection") { showConnection() }
+        button("Apps & delivery") { showApps() }
         button("Notification settings") {
             startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
         }
@@ -236,11 +331,7 @@ class MainActivity : Activity() {
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Clear") { _, _ ->
                     repository.whenReady {
-                        repository.history.snapshot().forEach { notifications.cancel(it.tag, 0) }
-                        repository.history.clear()
-                        repository.clearLog()
-                        repository.changed()
-                        repository.flush()
+                        repository.clearLocalData()
                         showHome()
                     }
                 }.show()
@@ -255,6 +346,13 @@ class MainActivity : Activity() {
     }
     private fun diagnosticsText() = "${AncsDiagnostics.status}\n\nReceived: ${AncsDiagnostics.received}\nPosted: ${AncsDiagnostics.posted}\nSaved cards: ${repository.history.cardCount}\n${repository.error ?: repository.logError ?: "Storage ready"}"
 
+    private fun resumeEnabledConnection() {
+        if (resumed && repository.loaded && AncsDiagnostics.phase == ConnectionPhase.DISCONNECTED &&
+            preferences.getBoolean("enabled", false) &&
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+            preferences.getString("phone", null)?.let { startBridge(AncsBridgeService.ACTION_CONNECT, it) }
+        }
+    }
     private fun connectSaved() = withPermissions {
         val address = preferences.getString("phone", null)
         if (address == null) showPhones() else {
@@ -301,6 +399,7 @@ class MainActivity : Activity() {
         }
     }
     private fun startBridge(action: String, address: String? = null) {
+        if (action == AncsBridgeService.ACTION_CONNECT) AncsDiagnostics.phase = if (repository.loaded) ConnectionPhase.CONNECTING else ConnectionPhase.LOADING
         startForegroundService(Intent(this, AncsBridgeService::class.java).setAction(action)
             .apply { if (address != null) putExtra(AncsBridgeService.EXTRA_ADDRESS, address) })
     }
@@ -309,14 +408,10 @@ class MainActivity : Activity() {
             "home" -> finish()
             "diagnostics" -> showSettings()
             "phones" -> showConnection()
+            "appSettings" -> showApps()
             else -> showHome()
         }
     }
-    private fun appName(app: String) = when (app) {
-        AncsConversationRules.MESSAGES -> "Messages"
-        AncsConversationRules.DISCORD -> "Discord"
-        "org.whispersystems.signal" -> "Signal"
-        else -> app
-    }
+    private fun appName(app: String) = repository.catalog.get(app).name
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 }

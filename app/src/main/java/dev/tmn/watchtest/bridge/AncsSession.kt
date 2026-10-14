@@ -19,7 +19,12 @@ class AncsSession(private val capacity: Int = 64) {
             return
         }
         pending.remove(event.uid)
-        if (pending.size >= capacity) pending.remove(pending.keys.first())
+        if (pending.size >= capacity) {
+            val historical = pending.values.firstOrNull { it.flags and 4 != 0 }
+            // Backlog must not evict fresh notifications when the request queue is full.
+            if (historical == null && event.flags and 4 != 0) return
+            pending.remove(historical?.uid ?: pending.keys.first())
+        }
         pending[event.uid] = event
     }
 

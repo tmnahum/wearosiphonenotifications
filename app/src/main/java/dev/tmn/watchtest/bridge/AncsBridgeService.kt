@@ -8,6 +8,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.*
 import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -35,6 +38,7 @@ class AncsBridgeService : Service() {
         const val EXTRA_TEXT = "text"
         private const val CHANNEL = "ancs_diagnostics"
         private const val MESSAGES = "iphone_notifications"
+        private const val SILENT_MESSAGES = "iphone_notifications_silent"
         private const val NOTIFICATION_ID = 41
         private val ANCS = UUID.fromString("7905F431-B5CE-4E99-A40F-4B1E122D00D0")
         private val NS = UUID.fromString("9FBF120D-6301-42D9-8C58-25E699A21DBD")
@@ -59,35 +63,59 @@ class AncsBridgeService : Service() {
     private val repository by lazy { HistoryRepository.get(this) }
     private val conversations get() = repository.history
     private var destroyed = false
+    private var appRequest: AncsAppAttributes? = null
+    private val pendingAppNames = linkedSetOf<String>()
+    private val attemptedAppNames = mutableSetOf<String>()
+    private val failedAppNames = mutableSetOf<String>()
+    private val appReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val id = intent?.getStringExtra("app") ?: return
+            renderChanges(AncsCardChanges(conversations.activeSnapshot().filter { it.app == id }, emptySet()), silent = true)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
+        registerReceiver(appReceiver, IntentFilter(HistoryRepository.EVENT_APPS), RECEIVER_NOT_EXPORTED)
         // A killed/replaced process cannot keep ANCS session identifiers alive.
         notifications.activeNotifications.filter { it.tag?.startsWith("ancs:") == true }
             .forEach { notifications.cancel(it.tag, it.id) }
     }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            publishState("Allow nearby-device permission to connect.", ConnectionPhase.ERROR)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (!foregroundStarted) {
             startForeground(NOTIFICATION_ID, foregroundNotification())
             foregroundStarted = true
         }
+        if (!repository.loaded) publishState("Loading saved state…", ConnectionPhase.LOADING)
         repository.whenReady {
             if (!destroyed) handleCommand(intent)
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
     private fun handleCommand(intent: Intent?) {
         try {
             when (intent?.action) {
+                null -> {
+                    val preferences = getSharedPreferences("relay", MODE_PRIVATE)
+                    val phone = preferences.getString("phone", null)
+                    if (preferences.getBoolean("enabled", false) && phone != null) connect(phone, retry = true)
+                    else { stopForeground(STOP_FOREGROUND_REMOVE); foregroundStarted = false; stopSelf() }
+                }
                 ACTION_SCAN -> listPairedDevices()
                 ACTION_CONNECT -> intent.getStringExtra(EXTRA_ADDRESS)?.let { connect(it) }
                 ACTION_DISCONNECT -> {
+                    getSharedPreferences("relay", MODE_PRIVATE).edit().putBoolean("enabled", false).apply()
                     selectedAddress = null
                     AncsDiagnostics.running = false
                     AncsDiagnostics.problem = false
                     closeSession()
-                    publishState("Disconnected")
+                    publishState("Disconnected", ConnectionPhase.DISCONNECTED)
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     foregroundStarted = false
                     stopSelf()
@@ -95,7 +123,7 @@ class AncsBridgeService : Service() {
             }
         } catch (_: SecurityException) { fail("Bluetooth permission is required.") }
     }
-    override fun onDestroy() { destroyed = true; AncsDiagnostics.running = false; selectedAddress = null; closeSession(); repository.flush(); super.onDestroy() }
+    override fun onDestroy() { unregisterReceiver(appReceiver); AncsDiagnostics.phase = ConnectionPhase.DISCONNECTED; destroyed = true; AncsDiagnostics.running = false; selectedAddress = null; closeSession(); super.onDestroy() }
 
     private fun listPairedDevices() {
         AncsDiagnostics.devices.clear()
@@ -114,15 +142,16 @@ class AncsBridgeService : Service() {
 
     private fun connect(address: String, retry: Boolean = false) {
         val device = bluetooth.adapter?.bondedDevices?.firstOrNull { it.address == address }
-        if (device == null) { publishState("Select an existing paired device; automatic pairing is disabled."); return }
+        if (device == null) { fail("The saved phone is no longer paired. Choose a paired iPhone."); return }
+        if (ready && selectedAddress == address) { publishState("Receiving iPhone notifications.", ConnectionPhase.CONNECTED); return }
         selectedAddress = address
         AncsDiagnostics.running = true
         AncsDiagnostics.problem = false
         if (!retry) retryAttempt = 0
         closeSession()
         conversations.beginSession(address)
-        getSharedPreferences("relay", MODE_PRIVATE).edit().putString("phone", address).apply()
-        publishState("Connecting to paired iPhone…")
+        getSharedPreferences("relay", MODE_PRIVATE).edit().putString("phone", address).putBoolean("enabled", true).apply()
+        publishState("Connecting to paired iPhone…", ConnectionPhase.CONNECTING)
         // This overload delivers callbacks on the same looper as service/UI state.
         gatt = device.connectGatt(this, retry, callback, BluetoothDevice.TRANSPORT_LE,
             BluetoothDevice.PHY_LE_1M_MASK, handler)
@@ -135,7 +164,7 @@ class AncsBridgeService : Service() {
             if (status != BluetoothGatt.GATT_SUCCESS || newState == BluetoothProfile.STATE_DISCONNECTED) {
                 fail("Disconnected (Bluetooth status $status).", retry = true)
             } else if (newState == BluetoothProfile.STATE_CONNECTED) {
-                publishState("Connected. Discovering notification service…")
+                publishState("Preparing notification service…", ConnectionPhase.DISCOVERING)
                 armTimeout("Service discovery timed out.")
                 if (!client.discoverServices()) fail("Could not start service discovery.")
             }
@@ -164,24 +193,24 @@ class AncsBridgeService : Service() {
                 AncsDiagnostics.connected = true
                 retryAttempt = 0
                 cancelTimeout()
-                publishState("ANCS connected. Waiting for iPhone notifications.")
+                publishState("Receiving iPhone notifications.", ConnectionPhase.CONNECTED)
                 processNext()
             }
         }
         override fun onCharacteristicWrite(client: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            if (client !== gatt || characteristic.uuid != CP || session.current == null) return
+            if (client !== gatt || characteristic.uuid != CP || (session.current == null && appRequest == null)) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 // ANCS errors have no response stream. A removed UID can legitimately return 0xA2.
                 if (status in 0xA0..0xA3) {
                     cancelTimeout()
-                    session.discardCurrent()
+                    if (appRequest != null) { failedAppNames.add(appRequest!!.app); appRequest = null } else session.discardCurrent()
                     publishState("iPhone declined a field request ($status). Continuing…")
                     processNext()
                 } else fail("Notification field write failed ($status).", retry = true)
                 return
             }
-            session.acknowledgeWrite()
-            finishResponse()
+            if (appRequest != null) { appRequest!!.acknowledgeWrite(); finishAppResponse() }
+            else { session.acknowledgeWrite(); finishResponse() }
         }
         override fun onCharacteristicChanged(client: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
             if (client !== gatt) return
@@ -198,10 +227,13 @@ class AncsBridgeService : Service() {
                     processNext()
                 }
                 DS -> {
-                    if (session.current == null) return
-                    try { session.append(value); finishResponse() }
-                    catch (error: IllegalArgumentException) { fail("Notification protocol error: ${error.message}. Reconnect.") }
-                    catch (_: IllegalStateException) { fail("Unexpected notification response. Reconnect.") }
+                    if (session.current == null && appRequest == null) return
+                    try {
+                        if (appRequest != null) { appRequest!!.append(value); finishAppResponse() }
+                        else { session.append(value); finishResponse() }
+                    }
+                    catch (error: IllegalArgumentException) { fail("Notification protocol error: ${error.message}. Reconnect.", retry = appRequest != null) }
+                    catch (_: IllegalStateException) { fail("Unexpected notification response. Reconnect.", retry = appRequest != null) }
                 }
             }
         }
@@ -211,6 +243,7 @@ class AncsBridgeService : Service() {
     }
 
     private fun subscribe(client: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        publishState("Enabling iPhone notifications…", ConnectionPhase.SUBSCRIBING)
         subscribing = characteristic.uuid
         val descriptor = characteristic.getDescriptor(CCCD)
         if (descriptor == null || !client.setCharacteristicNotification(characteristic, true)) {
@@ -221,7 +254,7 @@ class AncsBridgeService : Service() {
             fail("Could not start notification subscription.")
     }
     private fun processNext() {
-        if (!ready || session.current != null || session.pendingCount == 0 || requestTask != null) return
+        if (!ready || session.current != null || appRequest != null || (session.pendingCount == 0 && pendingAppNames.isEmpty()) || requestTask != null) return
         val client = gatt ?: return
         // Yield out of the GATT callback before starting the next ATT operation.
         requestTask = Runnable {
@@ -233,6 +266,15 @@ class AncsBridgeService : Service() {
         if (!ready) return
         val client = gatt ?: return
         val characteristic = control ?: return
+        val app = pendingAppNames.firstOrNull()
+        if (app != null) {
+            pendingAppNames.remove(app)
+            appRequest = AncsAppAttributes(app)
+            armTimeout("App-name response timed out. Reconnecting…", retry = true)
+            val status = client.writeCharacteristic(characteristic, appRequest!!.request(), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            if (status != BluetoothStatusCodes.SUCCESS) fail("Could not request app name ($status).", retry = true)
+            return
+        }
         val event = session.next() ?: return
         armTimeout("Notification response timed out. Reconnect to start a fresh session.")
         val status = client.writeCharacteristic(characteristic, AncsProtocol.getNotificationAttributes(event.uid),
@@ -240,12 +282,25 @@ class AncsBridgeService : Service() {
         if (status != BluetoothStatusCodes.SUCCESS)
             fail("Could not request notification fields ($status).", retry = true)
     }
+    private fun finishAppResponse() {
+        val request = appRequest ?: return
+        if (!request.complete) return
+        cancelTimeout()
+        appRequest = null
+        repository.appNameReceived(request.app, request.name)
+        processNext()
+    }
+    private fun queueAppName(id: String) {
+        if (id.isBlank() || id.toByteArray(Charsets.UTF_8).size > 1024 || '\u0000' in id) return
+        if (id !in failedAppNames && repository.catalog.get(id).displayName.isBlank() && attemptedAppNames.add(id)) pendingAppNames.add(id)
+    }
     private fun finishResponse() {
         if (!session.complete) return
         cancelTimeout()
         session.finish()?.let { result ->
             AncsDiagnostics.received++
             repository.recordNotification(result.event, result.fields)
+            queueAppName(result.fields[0].orEmpty())
             AncsDiagnostics.recordLayout(result.event.uid, result.fields)
             val labels = listOf("App identifier", "Title", "Subtitle", "Message", "Message size", "Date", "Positive action", "Negative action")
             val record = labels.mapIndexed { id, name -> "$name: ${result.fields[id].orEmpty()}" }.joinToString("\n") +
@@ -263,7 +318,13 @@ class AncsBridgeService : Service() {
         changes.removed.forEach { notifications.cancel(it, 0) }
         if (!notifications.areNotificationsEnabled()) return
         notifications.createNotificationChannel(NotificationChannel(MESSAGES, "iPhone notifications", NotificationManager.IMPORTANCE_HIGH))
+        notifications.createNotificationChannel(NotificationChannel(SILENT_MESSAGES, "Silent iPhone notifications", NotificationManager.IMPORTANCE_LOW))
         changes.updated.forEach { card ->
+            val app = repository.catalog.get(card.app)
+            if (app.settings.delivery == Delivery.MUTED) {
+                notifications.cancel(card.tag, 0)
+                return@forEach
+            }
             val latest = card.messages.last()
             // Android rejects posts once an app fills its notification quota. Keep room
             // for the foreground card/system summary, without deleting saved history.
@@ -274,20 +335,15 @@ class AncsBridgeService : Service() {
                 if (oldest == null || oldest.notification.`when` >= latest.timestamp.toEpochMilli()) return@forEach
                 notifications.cancel(oldest.tag, oldest.id)
             }
-            val builder = NotificationCompat.Builder(this, MESSAGES)
+            val builder = NotificationCompat.Builder(this, if (app.settings.delivery == Delivery.SILENT) SILENT_MESSAGES else MESSAGES)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle(card.title).setContentText(latest.text)
-                .setSubText(when (card.app) {
-                    AncsConversationRules.DISCORD -> "Discord"
-                    "com.apple.MobileSMS" -> "Messages"
-                    "org.whispersystems.signal" -> "Signal"
-                    else -> card.app
-                })
+                .setContentTitle(if (card.title == card.app) app.name else card.title).setContentText(latest.text)
+                .setSubText(app.name)
                 .setContentIntent(openApp()).setAutoCancel(false)
                 .setDeleteIntent(HistoryDismissReceiver.pendingIntent(this, card.tag))
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
                 .setWhen(latest.timestamp.toEpochMilli()).setShowWhen(true)
-                .setSilent(silent)
+                .setSilent(silent || app.settings.delivery == Delivery.SILENT)
             if (card.conversation) {
                 val style = NotificationCompat.MessagingStyle(Person.Builder().setName("You").build())
                     .setConversationTitle(card.title).setGroupConversation(card.isGroupConversation)
@@ -320,18 +376,22 @@ class AncsBridgeService : Service() {
         control = null
         subscribing = null
         session.clear()
+        appRequest = null
+        pendingAppNames.clear()
+        attemptedAppNames.clear()
         conversations.endSession()
         repository.flush()
         AncsDiagnostics.clearSession()
         send(EVENT_FIELDS)
     }
     private fun fail(message: String, retry: Boolean = false) {
+        appRequest?.let { failedAppNames.add(it.app) }
         closeSession()
         val address = selectedAddress
         if (retry && address != null) {
             val delay = (2_000L shl retryAttempt.coerceAtMost(5)).coerceAtMost(60_000L)
             retryAttempt++
-            publishState("$message Retrying in ${delay / 1000}s…")
+            publishState("$message Retrying in ${delay / 1000}s…", ConnectionPhase.RETRYING)
             reconnectTask = Runnable {
                 reconnectTask = null
                 if (selectedAddress == address) {
@@ -341,10 +401,11 @@ class AncsBridgeService : Service() {
             }.also { handler.postDelayed(it, delay) }
         } else {
             AncsDiagnostics.problem = true
-            publishState(message)
+            publishState(message, ConnectionPhase.ERROR)
         }
     }
-    private fun publishState(message: String) {
+    private fun publishState(message: String, phase: ConnectionPhase = AncsDiagnostics.phase) {
+        AncsDiagnostics.phase = phase
         AncsDiagnostics.status = message
         send(EVENT_STATE)
         // Keep live diagnostics in the app; reposting the service card bumps its tray ranking.
@@ -368,8 +429,9 @@ class AncsBridgeService : Service() {
     }
     /** Safe ADB diagnostics: deliberately excludes notification fields and device addresses. */
     override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
-        writer.println("ANCS ready=$ready events=${AncsDiagnostics.events} received=${AncsDiagnostics.received} posted=${AncsDiagnostics.posted} queued=${session.pendingCount} inFlight=${session.current != null} cards=${conversations.cardCount} conversations=${conversations.conversationCount}")
+        writer.println("ANCS ready=$ready events=${AncsDiagnostics.events} received=${AncsDiagnostics.received} posted=${AncsDiagnostics.posted} queued=${session.pendingCount} inFlight=${session.current != null || appRequest != null} cards=${conversations.cardCount} conversations=${conversations.conversationCount}")
         writer.println("Status: ${AncsDiagnostics.status}")
+        writer.println("Apps known=${repository.catalog.all().size} named=${repository.catalog.all().count { it.displayName.isNotBlank() }} phase=${AncsDiagnostics.phase}")
         writer.println("Storage loaded=${repository.loaded} saveError=${repository.error != null} logError=${repository.logError != null}")
         if (args?.firstOrNull() == "layout") {
             val query = args.drop(1).joinToString(" ").trim()

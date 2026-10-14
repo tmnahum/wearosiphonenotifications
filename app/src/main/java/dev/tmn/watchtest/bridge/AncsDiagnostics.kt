@@ -2,6 +2,7 @@ package dev.tmn.watchtest.bridge
 
 /** Main-thread, process-local state. No notification text is written to disk or logs. */
 object AncsDiagnostics {
+    var phase = ConnectionPhase.DISCONNECTED
     var problem = false
     var connected = false
     var running = false

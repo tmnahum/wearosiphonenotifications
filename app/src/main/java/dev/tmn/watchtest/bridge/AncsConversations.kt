@@ -7,7 +7,7 @@ import java.time.format.DateTimeFormatter
 
 /** Display-context grouping, not an iOS thread ID. Keys are display-label heuristics. */
 data class ConversationContext(val app: String, val rule: String, val labels: List<String>)
-data class ConversationMatch(val context: ConversationContext, val title: String, val sender: String, val isGroup: Boolean = true)
+data class ConversationMatch(val context: ConversationContext, val title: String, val sender: String, val isGroup: Boolean = true, val message: String? = null)
 
 object AncsConversationRules {
     const val MESSAGES = "com.apple.MobileSMS"
@@ -19,6 +19,26 @@ object AncsConversationRules {
     private fun isGenericMessagesTitle(title: String): Boolean =
         title.lowercase() in setOf("messages", "imessage", "message", "new message", "text message", "sms") ||
             Regex("^\\d+ (?:new )?(?:i)?messages?$", RegexOption.IGNORE_CASE).matches(title)
+
+    private fun usableLabel(label: String, app: String): Boolean =
+        label.isNotBlank() && label.lowercase() !in setOf("notification", "new notification", "new message", "messages", "message", "signal", "discord", "instagram", "iphone app") &&
+            !label.equals(AppCatalog.fallbackName(app), true) && !Regex("^\\d+ (new )?(messages|notifications)$", RegexOption.IGNORE_CASE).matches(label)
+
+    fun resolve(fields: Map<Int, String>, settings: AppSettings, appName: String): ConversationMatch? {
+        val app = fields[0].orEmpty()
+        if (settings.grouping == Grouping.SEPARATE) return null
+        if (settings.grouping == Grouping.APP) return ConversationMatch(
+            ConversationContext(app, "app-inbox", emptyList()), appName,
+            fields[1].orEmpty().ifBlank { appName }, true)
+        match(fields)?.let { return it }
+        val title = fields[1].orEmpty().trim()
+        val subtitle = fields[2].orEmpty().trim()
+        if (app.isBlank() || !usableLabel(title, app) || title.equals(appName, true) || fields[3].orEmpty().isBlank()) return null
+        if (fields[3].orEmpty().lowercase() in setOf("new message", "new notification")) return null
+        // Preserve exact context. Never use a sender alone when a subtitle distinguishes chats.
+        return ConversationMatch(ConversationContext(app, "fallback-title-subtitle", listOf(title, subtitle)),
+            listOf(title, subtitle).filter(String::isNotBlank).joinToString(" · "), title, subtitle.isNotBlank())
+    }
 
     fun match(fields: Map<Int, String>): ConversationMatch? {
         val app = fields[0].orEmpty()
@@ -36,6 +56,27 @@ object AncsConversationRules {
             // preview that omits group context. It is intentionally scoped to Messages.
             return ConversationMatch(ConversationContext(app, "messages-direct-sender", listOf(sender)),
                 sender, sender, isGroup = false)
+        }
+        if (app == "org.whispersystems.signal") {
+            val title = fields[1].orEmpty().trim()
+            val subtitle = fields[2].orEmpty().trim()
+            if (!usableLabel(title, app) || fields[3].orEmpty().isBlank()) return null
+            if (subtitle.isNotBlank()) return ConversationMatch(
+                ConversationContext(app, "signal-subtitle", listOf(subtitle)), subtitle, title)
+            // Signal's English group notification title format. Ambiguous/localized titles
+            // fall back to the complete visible title instead of guessing a separator.
+            val parts = title.split(" in ")
+            if (parts.size == 2 && parts.all(String::isNotBlank)) return ConversationMatch(
+                ConversationContext(app, "signal-group-title", listOf(parts[1])), parts[1], parts[0])
+            val body = fields[3].orEmpty()
+            val prefix = body.substringBefore(": ", "")
+            val hasSenderPrefix = prefix.length in 1..80 && '\n' !in prefix &&
+                prefix.lowercase() !in setOf("http", "https") && body.length > prefix.length + 2
+            // iOS communication notifications may export group title with sender in body.
+            // Grouping uses the complete title even when a particular preview omits a sender.
+            return ConversationMatch(ConversationContext(app, "signal-visible-title", listOf(title)), title,
+                if (hasSenderPrefix) prefix else title, hasSenderPrefix,
+                if (hasSenderPrefix) body.substring(prefix.length + 2) else null)
         }
         if (app != DISCORD || fields[2].orEmpty().isNotBlank() || fields[3].orEmpty().isBlank()) return null
         val parts = discordChannel.matchEntire(fields[1].orEmpty())?.groupValues ?: return null
@@ -60,7 +101,10 @@ data class AncsCard(
 data class AncsCardChanges(val updated: List<AncsCard>, val removed: Set<String>)
 
 /** Conversation model with optional bounds. The history adapter supplies durable local IDs. */
-class AncsConversationStore(private val maxCards: Int = Int.MAX_VALUE, private val maxMessages: Int = Int.MAX_VALUE) {
+class AncsConversationStore(private val maxCards: Int = Int.MAX_VALUE, private val maxMessages: Int = Int.MAX_VALUE,
+    private val appSettings: ((String) -> AppSettings)? = null,
+    private val appName: (String) -> String = AppCatalog::fallbackName,
+) {
     init { require(maxCards > 0 && maxMessages > 0) }
     private data class Key(val source: String, val context: ConversationContext?, val singleUid: Long?)
     private data class Entry(val key: Key, val app: String, val title: String, val isGroup: Boolean, val message: AncsCardMessage)
@@ -70,16 +114,18 @@ class AncsConversationStore(private val maxCards: Int = Int.MAX_VALUE, private v
     val cardCount get() = tags.size
     private val dateFormat = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss")
 
-    fun upsert(event: AncsProtocol.Event, fields: Map<Int, String>, now: Instant, source: String = "", trackChanges: Boolean = true): AncsCardChanges {
+    fun upsert(event: AncsProtocol.Event, fields: Map<Int, String>, now: Instant, source: String = "", trackChanges: Boolean = true, timestampOverride: Instant? = null): AncsCardChanges {
         val before = if (trackChanges) snapshot().associateBy { it.tag } else emptyMap()
         val previous = entries.remove(event.uid)
-        val match = AncsConversationRules.match(fields)
+        val sourceApp = fields[0].orEmpty()
+        val match = appSettings?.let { AncsConversationRules.resolve(fields, it(sourceApp), appName(sourceApp)) }
+            ?: if (appSettings == null) AncsConversationRules.match(fields) else null
         val key = Key(source, match?.context, if (match == null) event.uid else null)
         val app = fields[0].orEmpty().ifBlank { "iPhone" }
         val title = match?.title ?: fields[1].orEmpty().ifBlank { app }
-        val body = if (match != null) fields[3].orEmpty() else
+        val body = if (match != null && match.context.rule != "app-inbox") match.message ?: fields[3].orEmpty() else
             listOf(fields[2].orEmpty(), fields[3].orEmpty()).filter(String::isNotBlank).joinToString("\n")
-        val timestamp = runCatching {
+        val timestamp = timestampOverride ?: runCatching {
             LocalDateTime.parse(fields[5].orEmpty(), dateFormat).atZone(ZoneId.systemDefault()).toInstant()
         }.getOrNull() ?: previous?.message?.timestamp ?: if (event.flags and 4 != 0) Instant.EPOCH else now
         entries[event.uid] = Entry(key, app, title, match?.isGroup == true,
@@ -118,7 +164,7 @@ class AncsConversationStore(private val maxCards: Int = Int.MAX_VALUE, private v
         return tags.mapNotNull { (key, tag) ->
         val members = grouped[key].orEmpty().sortedBy { it.message.timestamp }
         val latest = members.lastOrNull() ?: return@mapNotNull null
-        AncsCard(tag, latest.app, latest.title, key.context != null, latest.isGroup, members.map { it.message })
+        AncsCard(tag, latest.app, latest.title, key.context != null, members.any { it.isGroup }, members.map { it.message })
     }
 
     }
