@@ -15,6 +15,29 @@ class HistoryRepository private constructor(context: Context) {
     private val app = context.applicationContext
     private val file = AtomicFile(File(app.noBackupFilesDir, "notification-history-v1.bin"))
     private val appFile = AtomicFile(File(app.noBackupFilesDir, "source-apps-v1.bin"))
+    private val postedCards = NativeTrayTracker()
+    private val notifications get() = app.getSystemService(NotificationManager::class.java)
+    // Catch a tray clear even if Wear delays the notification's delete-intent callback.
+    fun reconcileDismissals() {
+        if (!loaded || !notifications.areNotificationsEnabled() || postedCards.isEmpty()) return
+        val active = notifications.activeNotifications.mapNotNull { it.tag }.toSet()
+        val missing = postedCards.reconcile(active, android.os.SystemClock.elapsedRealtime())
+        if (missing.records.isEmpty()) return
+        if (missing.clearedTogether) history.dismissAllNotifications()
+        history.dismissRecords(missing.records)
+        changed(); flush()
+    }
+    fun nativePosted(card: AncsCard) { postedCards.posted(card.tag, card.messages.map { it.uid }.toSet(), android.os.SystemClock.elapsedRealtime()) }
+    fun cancelNative(tag: String, id: Int = 0) {
+        postedCards.forget(tag) // Programmatic removal must never masquerade as watch dismissal.
+        notifications.cancel(tag, id)
+    }
+    fun dismissNative(tag: String, throughId: Long) {
+        reconcileDismissals()
+        history.dismissConversation(tag, throughId)
+        postedCards.forgetThrough(tag, throughId)
+        changed()
+    }
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     var catalog = AppCatalog()
@@ -46,7 +69,7 @@ class HistoryRepository private constructor(context: Context) {
             }.mapCatching { saved ->
                 // Migrate existing installations: every previously observed app appears in Settings.
                 saved.records.forEach { restoredCatalog.observe(it.fields[0].orEmpty(), it.receivedAt.toEpochMilli()) }
-                NotificationHistory(restoredCatalog).apply { restore(saved.records, saved.dismissed) }
+                NotificationHistory(restoredCatalog).apply { restore(saved.records, saved.dismissed, saved.trayClearedThrough) }
             }
             main.post {
                 catalog = restoredCatalog
@@ -71,22 +94,25 @@ class HistoryRepository private constructor(context: Context) {
     }
     fun whenReady(action: () -> Unit) { if (loaded) action() else waiting.add(action) }
     fun recordNotification(event: AncsProtocol.Event, fields: Map<Int, String>) {
+        reconcileDismissals()
         val copy = fields.toMap(); val now = System.currentTimeMillis()
         catalog.observe(fields[0].orEmpty(), now)
         worker.execute { accessLog { append(event, copy, now) } }
     }
     fun appNameReceived(id: String, name: String) {
         if (name.isBlank()) return
+        reconcileDismissals()
         catalog.name(id, name)
         val old = history.snapshot().filter { it.app == id }.map { it.tag }.toSet()
         val changes = history.regroup()
-        changes.removed.filter { it in old }.forEach { app.getSystemService(NotificationManager::class.java).cancel(it, 0) }
+        changes.removed.filter { it in old }.forEach { cancelNative(it) }
         changed(); appsChanged(id)
     }
     fun updateApp(id: String, settings: AppSettings) {
         check(loaded)
+        reconcileDismissals()
         // Cancel old grouping/muted cards immediately; receiver redraws current live cards silently.
-        history.snapshot().filter { it.app == id }.forEach { app.getSystemService(NotificationManager::class.java).cancel(it.tag, 0) }
+        history.snapshot().filter { it.app == id }.forEach { cancelNative(it.tag) }
         catalog.settings(id, settings)
         history.regroup()
         changed(); flush(); appsChanged(id)
@@ -95,7 +121,7 @@ class HistoryRepository private constructor(context: Context) {
         app.sendBroadcast(Intent(EVENT_APPS).setPackage(app.packageName).putExtra("app", id))
     }
     fun clearLocalData() {
-        history.snapshot().forEach { app.getSystemService(NotificationManager::class.java).cancel(it.tag, 0) }
+        history.snapshot().forEach { cancelNative(it.tag) }
         history.clear()
         historyReadFailed = false // Explicit user clearing authorizes replacing an unreadable history.
         updateReadError()
@@ -124,11 +150,11 @@ class HistoryRepository private constructor(context: Context) {
         catch (error: Exception) { file.failWrite(stream); throw error }
     }
     private fun saveNow(onComplete: (() -> Unit)? = null) {
-        val snapshot = history.saved(); val dismissed = history.dismissed(); val apps = catalog.all()
+        val snapshot = history.saved(); val dismissed = history.dismissed(); val cutoffs = history.trayClearCutoffs(); val apps = catalog.all()
         val writeHistory = !historyReadFailed; val writeApps = !catalogReadFailed
         worker.execute {
             val result = runCatching {
-                if (writeHistory) atomicWrite(file) { HistoryCodec.write(it, snapshot, dismissed) }
+                if (writeHistory) atomicWrite(file) { HistoryCodec.write(it, snapshot, dismissed, cutoffs) }
                 if (writeApps) atomicWrite(appFile) { AppCatalogCodec.write(it, apps) }
             }
             main.post {

@@ -14,9 +14,22 @@ The foreground-service notification is a static, silent, low-importance card pos
 
 ## App controls
 
-**Apps & delivery** lists every observed source app, including apps recovered from existing history. Display names are fetched from the iPhone over ANCS and cached locally. Select an app to choose Normal, Silent (LOW-importance channel), or Muted delivery, and Automatic, One thread per app, or Separate grouping. Changes preserve saved messages and refresh current cards silently. Muting hides native notifications; the local history and 14-day log still collect them. App preferences survive clearing messages.
+The app appears in Recents. For watch-face connection status, edit your face, choose a short/long text complication slot, and select **iPhone connection status**. It shows Linked/Linking/Offline/Check; tap for Connection. State changes request updates, with periodic refresh as a fallback (watch-face scheduling can delay them).
 
-Automatic grouping uses Messages, Discord and Signal-specific visible layouts first. Signal supports visible chat titles, sender-prefixed group bodies, group subtitles and the English sender-in-group title. The default for other apps matches exact title and subtitle, excluding generic/hidden summary labels. These are heuristics rather than true conversation identifiers. Select Separate when labels are ambiguous, or One thread per app for an inbox such as Gmail.
+For a full swipe-over card, add **iPhone connection status** from the watch’s Tile picker. The Tile shows connection status and opens Connection settings; it does not expose notification contents.
+
+Turn the crown to scroll pages and settings pickers, with smoothed movement, speed-sensitive acceleration and native fling after a fast turn. Touching the screen or changing pages stops crown momentum. Open source-app preferences using **App settings** on a relayed notification or the settings button inside a saved conversation.
+
+**Apps & delivery** lists observed source apps with names fetched from the iPhone. Each app has four independent controls:
+- **Notifications: Show with alerts / Show silently / Hidden** — show cards using watch alert settings, show without sound/vibration, or keep only in history.
+- **Grouping: App default / Combine all notifications / Separate notifications / By conversation** — mail combines into an app inbox by default (Gmail, Apple Mail, or Email-category notifications); chats use app-specific context. By conversation explicitly opts mail out of app-wide grouping.
+- **Display style: Automatic / Message previews / Inbox list / Expanded text** — changes appearance independently of grouping.
+
+**Reset to app defaults** restores Show with alerts and default grouping/presentation for that app. It preserves history and tray dismissals. Old Muted settings migrate to Hidden.
+
+**Display style** is separate from grouping. Automatic prefers message previews for Instagram, Messages, Signal, Discord and WhatsApp, and inbox lists for Gmail and Mail. Other apps use the newest item’s iPhone category: Social → messages, Email → inbox, everything else → expanded text. Explicit per-app Message previews, Inbox list, or Expanded text settings always override these defaults. Categories and preferences persist across restarts; existing history/preferences are migrated. Native previews are bounded for platform layout/payload limits, while saved history remains uncapped.
+
+Automatic grouping uses Messages, Discord, Instagram and Signal-specific visible layouts first. Signal supports visible chat titles, sender-prefixed group bodies, group subtitles and the English sender-in-group title. The default for other apps matches exact title and subtitle, excluding generic/hidden summary labels. These are heuristics rather than true conversation identifiers. Select Separate when labels are ambiguous, or Combine all notifications for an inbox such as Gmail.
 
 Connection screens distinguish Bluetooth setup from fully subscribed notification delivery and automatic retries. Explicit Disconnect stays off; reopening an enabled app or sticky service recreation reconnects the saved phone. Boot startup is still not implemented.
 
@@ -26,7 +39,7 @@ Connection screens distinguish Bluetooth setup from fully subscribed notificatio
 - Local conversation history has **no message-count or conversation-count cap**. Native MessagingStyle cards include the most recent 25 messages, Android's notification-container capacity. The app pages the conversation list and message views. Android also limits outstanding app notifications: when the tray is full, older visible relay cards make room for newer ones without deleting their saved history.
 - `NotificationHistory` assigns durable local IDs. ANCS UIDs only map to them for the current Bluetooth session. On reconnect, pre-existing notifications with a valid posted date match saved app/title/subtitle/body/date fields within the same phone. Matching consumes occurrences one-for-one. Live duplicate messages remain distinct. Missing dates are not guessed; edits made while disconnected can produce a second record.
 - `HistoryRepository` restores off the UI thread and saves a versioned AtomicFile on a serial worker. Updates coalesce over 750 ms; orderly session teardown flushes. An abrupt process kill can lose the latest unflushed updates. No cloud backup.
-- Clearing a **watch notification** clears that conversation's saved preview. A private delete-intent receiver handles swipe/clear-all. Tapping a notification opens the app without clearing it. Clearing a notification on the **iPhone** may remove its active watch card, but preserves local conversation history, per user preference.
+- Clearing a **watch notification** hides its posted items from the tray while keeping them in app history. Dismissals persist through edits, replay, restart and settings changes. New messages can appear without including dismissed items. A private delete intent plus reconciliation against active native cards handles dismissal; programmatic cancellations are tracked separately. Clearing multiple tracked cards together also suppresses older queued/replayed backlog. Clearing on the **iPhone** preserves app history too. Only **Clear all local data** deletes local history.
 - Content fingerprints of locally cleared notifications prevent dated backlog replays from resurrecting them. Only fingerprints are retained, not cleared message bodies. Undated replays cannot be suppressed reliably. Clearing all local data removes conversations and the separate log; suppression fingerprints remain to prevent immediate replay resurrection.
 - `NotificationLog` keeps a separate SQLite archive of received notification observations for 14 days, including replay/update indicators and posted dates. It is groundwork for a future history feature, not a chat-history source or archive browser. Reconnect observations can appear more than once. Expired entries are removed on startup, on writes, on app resume and hourly while the process runs; after the app is stopped, cleanup resumes on next start. Watch notification dismissal does not clear this log. **Settings → Clear all local data** clears both the conversations and log.
 
@@ -36,7 +49,7 @@ Both storage files live in app-private `noBackupFilesDir`; backup is disabled. N
 
 `AncsProtocol.kt` validates events, request encoding and fragmented responses. `AncsSession.kt` serializes requests, handles write/response ordering, suppresses removed/superseded requests and prioritizes fresh events over backlog. The queue remains bounded at 512 pending UIDs; this is transport backpressure, not a history retention cap.
 
-49 JVM tests cover protocol/session handling, grouping, restart/reconnect merging, repeated identical messages, source isolation, edits, watch-vs-phone dismissal, retention beyond the old limits, codec corruption and the 14-day cutoff. Build and lint are required before installation. Real watch ranking, swipe dismissal and long-run reconnects require device verification.
+72 JVM tests cover protocol/session handling, grouping, restart/reconnect merging, repeated identical messages, source isolation, edits, watch-vs-phone dismissal, retention beyond the old limits, codec corruption and the 14-day cutoff. Build and lint are required before installation. Real watch ranking, swipe dismissal and long-run reconnects require device verification.
 
 ## Build
 

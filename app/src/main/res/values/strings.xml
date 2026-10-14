@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">iPhone Connection</string>
+    <string name="connection_status">iPhone connection status</string>
+    <string name="connection_tile_description">See whether iPhone notifications are connected and open connection settings.</string>
 </resources>

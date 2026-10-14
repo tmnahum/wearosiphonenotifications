@@ -17,6 +17,8 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.view.InputDevice
+import android.view.MotionEvent
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -29,6 +31,9 @@ import dev.tmn.watchtest.bridge.HistoryRepository
 import dev.tmn.watchtest.bridge.ConnectionPhase
 import dev.tmn.watchtest.bridge.Delivery
 import dev.tmn.watchtest.bridge.Grouping
+import dev.tmn.watchtest.bridge.DisplayStyle
+import dev.tmn.watchtest.bridge.AppDefaults
+import dev.tmn.watchtest.bridge.AppSettings
 import java.text.DateFormat
 import java.util.Date
 
@@ -38,6 +43,9 @@ class MainActivity : Activity() {
     private val preferences by lazy { getSharedPreferences("relay", MODE_PRIVATE) }
     private val notifications get() = getSystemService(NotificationManager::class.java)
     private lateinit var content: LinearLayout
+    private lateinit var pageScroll: ScrollView
+    private var crown: CrownScrollController? = null
+    private var settingsFromConversation = false
     private var statusView: TextView? = null
     private var connectionButton: Button? = null
     private var connectionAction: Button? = null
@@ -66,9 +74,34 @@ class MainActivity : Activity() {
         repository.whenReady {
             if (!isDestroyed) {
                 resumeEnabledConnection()
+                openDestination(intent)
                 refresh()
             }
         }
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        repository.whenReady { if (!isDestroyed) openDestination(intent) }
+    }
+    private fun openDestination(destination: Intent) {
+        if (destination.getBooleanExtra(EXTRA_CONNECTION_SETTINGS, false)) {
+            destination.removeExtra(EXTRA_CONNECTION_SETTINGS)
+            showConnection()
+            return
+        }
+        val app = destination.getStringExtra(EXTRA_APP_SETTINGS) ?: return
+        destination.removeExtra(EXTRA_APP_SETTINGS)
+        selectedApp = app
+        settingsFromConversation = false
+        showAppSettings()
+    }
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (event.action == MotionEvent.ACTION_SCROLL && event.isFromSource(InputDevice.SOURCE_ROTARY_ENCODER) && ::pageScroll.isInitialized) {
+            crown?.onRotary(event)
+            return true
+        }
+        return super.dispatchGenericMotionEvent(event)
     }
     override fun onResume() {
         super.onResume()
@@ -88,6 +121,7 @@ class MainActivity : Activity() {
     }
     override fun onPause() {
         resumed = false
+        crown?.stop()
         if (registered) { unregisterReceiver(receiver); registered = false }
         super.onPause()
     }
@@ -96,6 +130,7 @@ class MainActivity : Activity() {
     }
 
     private fun page(name: String, title: String) {
+        crown?.stop()
         screen = name
         statusView = null
         connectionButton = null
@@ -109,11 +144,19 @@ class MainActivity : Activity() {
             setPadding(dp(24), dp(28), dp(24), dp(36))
             gravity = Gravity.CENTER_HORIZONTAL
         }
-        setContentView(ScrollView(this).apply {
+        pageScroll = ScrollView(this).apply {
             setBackgroundColor(Color.BLACK)
             isFillViewport = true
+            isFocusableInTouchMode = true
             addView(content)
-        })
+        }
+        setContentView(pageScroll)
+        pageScroll.requestFocus()
+        crown = CrownScrollController(pageScroll, { pageScroll.scrollBy(0, it) }, { pageScroll.fling(it) })
+        pageScroll.setOnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) crown?.onTouchDown()
+            false
+        }
         label(title, 22f, Color.WHITE, bold = true)
     }
     private fun label(text: String, size: Float = 13f, color: Int = muted, bold: Boolean = false,
@@ -150,7 +193,7 @@ class MainActivity : Activity() {
             if (AncsDiagnostics.phase == ConnectionPhase.DISCONNECTED) connectSaved() else showConnection()
         }
         button("Apps & delivery") { showApps() }
-        label("Recent conversations", 16f, Color.WHITE, bold = true)
+        label("Notification history", 16f, Color.WHITE, bold = true)
         historyList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             content.addView(this, LinearLayout.LayoutParams(-1, -2))
@@ -182,7 +225,7 @@ class MainActivity : Activity() {
                     if (cards.isEmpty()) label(if (repository.loaded) "Messages will appear here when your iPhone sends notifications." else "Loading saved conversations…", parent = list)
                     cards.take(visibleConversations).forEach { card ->
                         val latest = card.messages.last()
-                        button("${card.title}\n${appName(card.app)} · ${card.messages.size} ${if (card.messages.size == 1) "message" else "messages"}", parent = list) {
+                        button("${card.title}\n${appName(card.app)} · ${card.messages.size} ${if (card.messages.size == 1) "item" else "items"}", parent = list) {
                             selectedTag = card.tag
                             visibleMessages = 50
                             showConversation()
@@ -217,6 +260,11 @@ class MainActivity : Activity() {
         button("Back") { showHome() }
         if (card == null) { label("This conversation is no longer saved."); return }
         label(appName(card.app))
+        button("${appName(card.app)} settings") {
+            selectedApp = card.app
+            settingsFromConversation = true
+            showAppSettings()
+        }
         if (card.messages.size > visibleMessages) button("Show older messages") {
             visibleMessages += 50
             showConversation()
@@ -236,7 +284,7 @@ class MainActivity : Activity() {
         }
         label("Saved from iPhone notifications")
         button("Refresh") { showConversation() }
-        button("All conversations") { showHome() }
+        button("All history") { showHome() }
     }
     private fun showConnection() {
         page("connection", "Connection")
@@ -279,8 +327,8 @@ class MainActivity : Activity() {
         val apps = repository.catalog.all().sortedBy { it.name.lowercase() }
         if (apps.isEmpty()) label("Apps appear after their first notification arrives.", parent = list)
         apps.take(appPageSize).forEach { app ->
-            val delivery = when (app.settings.delivery) { Delivery.NORMAL -> "Normal"; Delivery.SILENT -> "Silent"; Delivery.MUTED -> "Muted" }
-            button("${app.name} · $delivery", parent = list) { selectedApp = app.id; showAppSettings() }
+            val delivery = if (app.settings.hidden) "Hidden" else if (app.settings.delivery == Delivery.SILENT) "Shown · silent" else "Shown · alerts"
+            button("${app.name} · $delivery", parent = list) { selectedApp = app.id; settingsFromConversation = false; showAppSettings() }
         }
         if (apps.size > appPageSize) button("More apps", parent = list) { appPageSize += 20; appsRevision = -1; refreshApps() }
     }
@@ -288,34 +336,82 @@ class MainActivity : Activity() {
         val id = selectedApp ?: return showApps()
         val app = repository.catalog.get(id)
         page("appSettings", app.name)
-        val deliveryLabels = arrayOf("Normal", "Silent", "Muted")
-        button("Delivery: ${deliveryLabels[app.settings.delivery.ordinal]}") {
-            AlertDialog.Builder(this).setTitle("Delivery")
-                .setSingleChoiceItems(deliveryLabels, app.settings.delivery.ordinal) { dialog, which ->
-                    repository.updateApp(id, repository.catalog.get(id).settings.copy(delivery = Delivery.entries[which]))
-                    dialog.dismiss(); showAppSettings()
-                }.setNegativeButton("Cancel", null).show()
+        val notificationLabels = arrayOf("Show with alerts", "Show silently", "Hidden")
+        val notificationChoice = when {
+            app.settings.hidden -> 2
+            app.settings.delivery == Delivery.SILENT -> 1
+            else -> 0
         }
-        label(when (app.settings.delivery) {
-            Delivery.NORMAL -> "Show notifications with your watch’s normal alerts."
-            Delivery.SILENT -> "Show notifications without sound or vibration."
-            Delivery.MUTED -> "Hide this app’s watch notifications. Local history and log are still kept."
-        })
-        val groupingLabels = arrayOf("Automatic", "One thread per app", "Separate notifications")
+        button("Notifications: ${notificationLabels[notificationChoice]}") {
+            AlertDialog.Builder(this).setTitle("Notifications")
+                .setSingleChoiceItems(notificationLabels, notificationChoice) { dialog, which ->
+                    val settings = repository.catalog.get(id).settings
+                    repository.updateApp(id, when (which) {
+                        0 -> settings.copy(hidden = false, delivery = Delivery.NORMAL)
+                        1 -> settings.copy(hidden = false, delivery = Delivery.SILENT)
+                        else -> settings.copy(hidden = true)
+                    })
+                    dialog.dismiss(); showAppSettings()
+                }.setNegativeButton("Cancel", null).create().also { showChoiceDialog(it) }
+        }
+        label("With alerts follows your watch’s sound and vibration settings. Silently shows cards without alerts. Hidden keeps notifications only in app history. Dismissed items stay dismissed.")
+        val groupingLabels = arrayOf("App default", "Combine all notifications", "Separate notifications", "By conversation")
         button("Grouping: ${groupingLabels[app.settings.grouping.ordinal]}") {
             AlertDialog.Builder(this).setTitle("Grouping")
                 .setSingleChoiceItems(groupingLabels, app.settings.grouping.ordinal) { dialog, which ->
                     repository.updateApp(id, repository.catalog.get(id).settings.copy(grouping = Grouping.entries[which]))
                     dialog.dismiss(); showAppSettings()
-                }.setNegativeButton("Cancel", null).show()
+                }.setNegativeButton("Cancel", null).create().also { showChoiceDialog(it) }
         }
         label(when (app.settings.grouping) {
-            Grouping.AUTOMATIC -> "Use chat context when available. Other notifications group by matching title and subtitle."
-            Grouping.APP -> "Combine everything from ${app.name} into one preview."
+            Grouping.AUTOMATIC -> if (AppDefaults.combinesMail(id)) "Default: combine all mail from ${app.name} into one card." else "Default: email combines into one app card; chats use conversation context; other alerts match title and subtitle."
+            Grouping.CONVERSATION -> "Group by chat context or matching title and subtitle, including for mail."
+            Grouping.APP -> "Put all ${app.name} notifications in one card, even from different chats or senders."
             Grouping.SEPARATE -> "Keep each notification as its own card."
         })
-        button("Back") { showApps() }
+        val styleLabels = arrayOf("Automatic", "Message previews", "Inbox list", "Expanded text")
+        button("Display style: ${styleLabels[app.settings.displayStyle.ordinal]}") {
+            AlertDialog.Builder(this).setTitle("Display style")
+                .setSingleChoiceItems(styleLabels, app.settings.displayStyle.ordinal) { dialog, which ->
+                    repository.updateApp(id, repository.catalog.get(id).settings.copy(displayStyle = DisplayStyle.entries[which]))
+                    dialog.dismiss(); showAppSettings()
+                }.setNegativeButton("Cancel", null).create().also { showChoiceDialog(it) }
+        }
+        label(when (app.settings.displayStyle) {
+            DisplayStyle.AUTOMATIC -> "Popular chat apps (including Instagram) use messages; Gmail and Mail use inbox lists. Other apps use the latest iPhone category: social → messages, email → inbox, otherwise text."
+            DisplayStyle.MESSAGES -> "Show sender names and messages as a conversation preview."
+            DisplayStyle.INBOX -> "Show recent notifications as a compact list."
+            DisplayStyle.TEXT -> "Show notification text without a conversation layout."
+        })
+        label("Display style changes how a card looks. Grouping controls which notifications share it. Saved history is unchanged.")
+        button("Reset to app defaults") {
+            repository.updateApp(id, AppSettings())
+            showAppSettings()
+        }
+        label("Reset restores Show with alerts, app-default grouping and Automatic display. Mail combines into one card. History and dismissals are preserved.")
+        button("Back") { leaveAppSettings() }
     }
+    private fun leaveAppSettings() {
+        if (settingsFromConversation) showConversation() else showApps()
+    }
+    private fun showChoiceDialog(dialog: AlertDialog) {
+        dialog.show()
+        val list = dialog.listView
+        val dialogCrown = CrownScrollController(list, { list.scrollListBy(it) }, { list.fling(it) })
+        list.isFocusableInTouchMode = true
+        list.requestFocus()
+        list.setOnGenericMotionListener { _, event ->
+            if (event.action == MotionEvent.ACTION_SCROLL && event.isFromSource(InputDevice.SOURCE_ROTARY_ENCODER)) {
+                dialogCrown.onRotary(event); true
+            } else false
+        }
+        list.setOnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) dialogCrown.onTouchDown()
+            false
+        }
+        dialog.setOnDismissListener { dialogCrown.stop() }
+    }
+
     private fun showSettings() {
         page("settings", "Settings")
         button("Connection") { showConnection() }
@@ -323,7 +419,7 @@ class MainActivity : Activity() {
         button("Notification settings") {
             startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
         }
-        label("Saved on this watch\nHistory stays until you clear its watch notification or clear it here. Clearing on iPhone keeps this history. No message-count limit or cloud backup.")
+        label("Saved on this watch\nClearing the watch tray hides notifications but keeps this history. Clearing on iPhone also keeps history. Delete history using Clear all local data below. No message-count limit or cloud backup.")
         label("Notification log · 14 days\nA separate local log is kept for future history browsing.")
         button("Clear all local data") {
             AlertDialog.Builder(this).setTitle("Clear all local data?")
@@ -336,6 +432,8 @@ class MainActivity : Activity() {
                     }
                 }.show()
         }
+        label("Watch-face status\nEdit your watch face, choose a text complication slot, then select iPhone connection status. Tap it to open Connection.")
+        label("Connection Tile\nAdd iPhone connection status to your watch’s Tiles for a full connection card. Tap Connection to manage it.")
         button("Diagnostics") { showDiagnostics() }
         button("Back") { showHome() }
     }
@@ -405,13 +503,17 @@ class MainActivity : Activity() {
     }
     private fun navigateBack() {
         when (screen) {
-            "home" -> finish()
+            "home" -> moveTaskToBack(true)
             "diagnostics" -> showSettings()
             "phones" -> showConnection()
-            "appSettings" -> showApps()
+            "appSettings" -> leaveAppSettings()
             else -> showHome()
         }
     }
     private fun appName(app: String) = repository.catalog.get(app).name
+    companion object {
+        const val EXTRA_APP_SETTINGS = "source_app_settings"
+        const val EXTRA_CONNECTION_SETTINGS = "connection_settings"
+    }
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 }

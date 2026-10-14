@@ -9,7 +9,7 @@ import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 
 /** Local IDs are durable. Remote UIDs are never persisted or reused across ANCS sessions. */
-data class SavedNotification(val id: Long, val source: String, val fields: Map<Int, String>, val receivedAt: Instant)
+data class SavedNotification(val id: Long, val source: String, val fields: Map<Int, String>, val receivedAt: Instant, val category: Int = -1, val trayDismissed: Boolean = false, val trayDismissedAt: Long = 0)
 
 class NotificationHistory(private val catalog: AppCatalog = AppCatalog()) {
     private val store = AncsConversationStore(appSettings = { catalog.get(it).settings }, appName = { catalog.get(it).name })
@@ -19,13 +19,33 @@ class NotificationHistory(private val catalog: AppCatalog = AppCatalog()) {
     private var source = ""
     private var nextId = System.currentTimeMillis() * 1_000L
     private val clearedFingerprints = mutableSetOf<String>()
+    private val trayClearedThrough = mutableMapOf<String, Long>()
     private val ignoredUids = mutableSetOf<Long>()
     val cardCount get() = store.cardCount
     val conversationCount get() = store.conversationCount
     fun snapshot() = store.snapshot()
     fun activeSnapshot(): List<AncsCard> {
         val ids = remoteIds.values.toSet()
-        return snapshot().filter { card -> card.messages.any { it.uid in ids } }
+        return snapshot().mapNotNull(::notificationCard).filter { card -> card.messages.any { it.uid in ids } }
+    }
+    /** History and the native tray have separate lifetimes. */
+    fun notificationCard(card: AncsCard): AncsCard? {
+        val messages = card.messages.filter { records[it.uid]?.trayDismissed == false }
+        return if (messages.isEmpty()) null else card.copy(messages = messages)
+    }
+    fun dismissRecords(ids: Set<Long>, now: Long = System.currentTimeMillis()) {
+        ids.forEach { id -> records[id]?.let { records[id] = it.copy(trayDismissed = true, trayDismissedAt = maxOf(it.trayDismissedAt, now)) } }
+    }
+    fun dismissConversation(tag: String, throughId: Long = Long.MAX_VALUE) {
+        val ids = snapshot().firstOrNull { it.tag == tag }?.messages.orEmpty()
+            .filter { it.uid <= throughId }.map { it.uid }.toSet()
+        dismissRecords(ids)
+    }
+    fun trayClearCutoffs() = trayClearedThrough.toMap()
+    fun dismissAllNotifications(now: Long = System.currentTimeMillis()) {
+        if (source.isBlank()) return
+        trayClearedThrough[source] = maxOf(trayClearedThrough[source] ?: 0, now)
+        dismissRecords(records.values.filter { it.source == source }.map { it.id }.toSet(), now)
     }
     fun saved() = records.values.toList()
     fun dismissed() = clearedFingerprints.toSet()
@@ -48,26 +68,33 @@ class NotificationHistory(private val catalog: AppCatalog = AppCatalog()) {
         val existing = remoteIds[event.uid]
         // Only replayed notifications are matched across sessions. Live repeated messages
         // always get separate IDs, even with identical text and second-resolution timestamps.
-        val matched = if (existing == null && event.flags and 4 != 0 && validDate(fields[5])) {
-            replayCandidates.firstOrNull { id -> records[id]?.let { sameNotification(it.fields, fields) } == true }
+        val matched = if (existing == null && event.flags and 4 != 0) {
+            replayCandidates.firstOrNull { id -> records[id]?.let { (validDate(fields[5]) || it.trayDismissed) && sameNotification(it.fields, fields) } == true }
         } else null
         val id = existing ?: matched ?: nextId++
         replayCandidates.remove(id) // Each historical occurrence can match at most once.
         remoteIds[event.uid] = id
         val previous = records[id]
-        val saved = SavedNotification(id, source, fields.filterKeys { it in 0..5 }.toMap(), previous?.receivedAt ?: now)
+        val saved = SavedNotification(id, source, fields.filterKeys { it in 0..5 }.toMap(), previous?.receivedAt ?: now, event.category, previous?.trayDismissed ?: false, previous?.trayDismissedAt ?: 0)
         records[id] = saved
         val stableTime = previous?.takeIf { it.fields[5].orEmpty() == fields[5].orEmpty() }?.receivedAt
         val changes = store.upsert(event.copy(uid = id), fields, saved.receivedAt, source, timestampOverride = stableTime)
-        snapshot().flatMap { it.messages }.firstOrNull { it.uid == id }?.let {
-            records[id] = saved.copy(receivedAt = it.timestamp)
+        val localCard = snapshot().firstOrNull { card -> card.messages.any { it.uid == id } }
+        localCard?.messages?.firstOrNull { it.uid == id }?.let { message ->
+            val cutoff = maxOf(trayClearedThrough[source] ?: 0,
+                localCard.messages.maxOfOrNull { records[it.uid]?.trayDismissedAt ?: 0 } ?: 0)
+            val dismissedBacklog = event.flags and 4 != 0 && cutoff > 0 && message.timestamp.toEpochMilli() <= cutoff
+            records[id] = saved.copy(receivedAt = message.timestamp,
+                trayDismissed = saved.trayDismissed || dismissedBacklog,
+                trayDismissedAt = if (dismissedBacklog) maxOf(saved.trayDismissedAt, cutoff) else saved.trayDismissedAt)
         }
         prune()
         // On a new service instance, an unchanged replay still represents an active phone
         // notification and needs a silent tray card. Disk restoration alone never posts cards.
         val replayCard = if (matched != null) snapshot().firstOrNull { card -> card.messages.any { it.uid == id } } else null
-        return if (replayCard != null && changes.updated.none { it.tag == replayCard.tag })
+        val result = if (replayCard != null && changes.updated.none { it.tag == replayCard.tag })
             changes.copy(updated = changes.updated + replayCard) else changes
+        return result.copy(updated = result.updated.mapNotNull(::notificationCard))
     }
 
     /** Dismiss the active card, but keep collected conversation history for the app/next message. */
@@ -76,18 +103,19 @@ class NotificationHistory(private val catalog: AppCatalog = AppCatalog()) {
         val card = snapshot().firstOrNull { it.messages.any { message -> message.uid == id } }
             ?: return AncsCardChanges(emptyList(), emptySet())
         val active = remoteIds.values.toSet()
-        return if (card.messages.any { it.uid in active }) AncsCardChanges(emptyList(), emptySet())
+        return if (card.messages.any { it.uid in active && records[it.uid]?.trayDismissed == false }) AncsCardChanges(emptyList(), emptySet())
         else AncsCardChanges(emptyList(), setOf(card.tag))
     }
 
-    fun restore(saved: List<SavedNotification>, dismissed: Set<String> = emptySet()) {
+    fun restore(saved: List<SavedNotification>, dismissed: Set<String> = emptySet(), cutoffs: Map<String, Long> = emptyMap()) {
         store.clear(); records.clear(); endSession(); clearedFingerprints.clear()
         clearedFingerprints.addAll(dismissed)
+        trayClearedThrough.clear(); trayClearedThrough.putAll(cutoffs)
         require(saved.map { it.id }.distinct().size == saved.size)
         saved.forEach { record ->
             require(record.id in 1 until Long.MAX_VALUE)
             records[record.id] = record
-            store.upsert(AncsProtocol.Event(0, 0, 0, 0, record.id), record.fields, record.receivedAt, record.source, trackChanges = false, timestampOverride = record.receivedAt)
+            store.upsert(AncsProtocol.Event(0, 0, record.category, 0, record.id), record.fields, record.receivedAt, record.source, trackChanges = false, timestampOverride = record.receivedAt)
             nextId = maxOf(nextId, record.id + 1)
         }
         prune()
@@ -97,7 +125,7 @@ class NotificationHistory(private val catalog: AppCatalog = AppCatalog()) {
         val before = snapshot().map { it.tag }.toSet()
         store.clear()
         records.values.forEach { record ->
-            store.upsert(AncsProtocol.Event(0, 0, 0, 0, record.id), record.fields, record.receivedAt,
+            store.upsert(AncsProtocol.Event(0, 0, record.category, 0, record.id), record.fields, record.receivedAt,
                 record.source, trackChanges = false, timestampOverride = record.receivedAt)
         }
         val after = snapshot()
@@ -142,29 +170,36 @@ class NotificationHistory(private val catalog: AppCatalog = AppCatalog()) {
         listOf(0, 1, 2, 3, 5).all { a[it].orEmpty() == b[it].orEmpty() }
 }
 
-data class SavedHistory(val records: List<SavedNotification>, val dismissed: Set<String>)
+data class SavedHistory(val records: List<SavedNotification>, val dismissed: Set<String>, val trayClearedThrough: Map<String, Long> = emptyMap())
 
 /** Versioned format with field-size and file-length validation. No Java object deserialization and no session Bluetooth handles. */
 object HistoryCodec {
     private const val MAGIC = 0x57485231
-    fun write(output: OutputStream, records: List<SavedNotification>, dismissed: Set<String> = emptySet()) {
+    fun write(output: OutputStream, records: List<SavedNotification>, dismissed: Set<String> = emptySet(), cutoffs: Map<String, Long> = emptyMap()) {
         val data = DataOutputStream(output)
         data.writeInt(MAGIC)
-        data.writeInt(1)
+        data.writeInt(3)
         data.writeInt(records.size)
         records.forEach { record ->
             data.writeLong(record.id)
             data.writeUTF(record.source)
             data.writeLong(record.receivedAt.toEpochMilli())
             for (key in 0..5) data.writeUTF(record.fields[key].orEmpty())
+            data.writeInt(record.category)
+            data.writeBoolean(record.trayDismissed)
+            data.writeLong(record.trayDismissedAt)
         }
         data.writeInt(dismissed.size)
         dismissed.forEach(data::writeUTF)
+        data.writeInt(cutoffs.size)
+        cutoffs.forEach { (source, time) -> data.writeUTF(source); data.writeLong(time) }
         data.flush()
     }
     fun read(input: InputStream): SavedHistory {
         val data = DataInputStream(input)
-        require(data.readInt() == MAGIC && data.readInt() == 1) { "Unsupported history format" }
+        require(data.readInt() == MAGIC) { "Unsupported history format" }
+        val version = data.readInt()
+        require(version in 1..3) { "Unsupported history format" }
         val count = data.readInt()
         require(count >= 0 && count <= data.available() / 30)
         val records = List(count) {
@@ -173,12 +208,21 @@ object HistoryCodec {
             require(source.length <= 128)
             val received = Instant.ofEpochMilli(data.readLong())
             val fields = (0..5).associateWith { data.readUTF().also { require(it.length <= 4096) } }
-            SavedNotification(id, source, fields, received)
+            val category = if (version >= 2) data.readInt().also { require(it in -1..255) } else -1
+            SavedNotification(id, source, fields, received, category, if (version >= 3) data.readBoolean() else false, if (version >= 3) data.readLong().also { require(it >= 0) } else 0)
         }
         val dismissedCount = data.readInt()
         require(dismissedCount >= 0 && dismissedCount <= data.available() / 66)
         val dismissed = List(dismissedCount) { data.readUTF().also { require(it.matches(Regex("[0-9a-f]{64}"))) } }.toSet()
+        val cutoffs = if (version >= 3) {
+            val size = data.readInt(); require(size >= 0 && size <= data.available() / 10)
+            buildMap { repeat(size) {
+                val source = data.readUTF(); require(source.length <= 128)
+                val time = data.readLong(); require(time >= 0)
+                require(put(source, time) == null)
+            } }
+        } else emptyMap()
         require(data.read() == -1) { "Trailing history data" }
-        return SavedHistory(records, dismissed)
+        return SavedHistory(records, dismissed, cutoffs)
     }
 }

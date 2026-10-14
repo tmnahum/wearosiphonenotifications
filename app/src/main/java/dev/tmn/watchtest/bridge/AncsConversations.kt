@@ -12,6 +12,7 @@ data class ConversationMatch(val context: ConversationContext, val title: String
 object AncsConversationRules {
     const val MESSAGES = "com.apple.MobileSMS"
     const val DISCORD = "com.hammerandchisel.discord"
+    const val INSTAGRAM = "com.burbn.instagram"
     // Observed on this iPhone. Discord isolates each display label with FSI/PDI.
     // Requiring the actual delimiters avoids splitting punctuation inside a sender/channel name.
     private val discordChannel = Regex("^\\u2068([^\\u2068\\u2069]+)\\u2069 \\(\\u2068(#[^\\u2068\\u2069]+)\\u2069, \\u2068([^\\u2068\\u2069]+)\\u2069\\)$")
@@ -24,10 +25,10 @@ object AncsConversationRules {
         label.isNotBlank() && label.lowercase() !in setOf("notification", "new notification", "new message", "messages", "message", "signal", "discord", "instagram", "iphone app") &&
             !label.equals(AppCatalog.fallbackName(app), true) && !Regex("^\\d+ (new )?(messages|notifications)$", RegexOption.IGNORE_CASE).matches(label)
 
-    fun resolve(fields: Map<Int, String>, settings: AppSettings, appName: String): ConversationMatch? {
+    fun resolve(fields: Map<Int, String>, settings: AppSettings, appName: String, category: Int = -1): ConversationMatch? {
         val app = fields[0].orEmpty()
         if (settings.grouping == Grouping.SEPARATE) return null
-        if (settings.grouping == Grouping.APP) return ConversationMatch(
+        if (settings.grouping == Grouping.APP || (settings.grouping == Grouping.AUTOMATIC && AppDefaults.combinesMail(app, category))) return ConversationMatch(
             ConversationContext(app, "app-inbox", emptyList()), appName,
             fields[1].orEmpty().ifBlank { appName }, true)
         match(fields)?.let { return it }
@@ -42,6 +43,17 @@ object AncsConversationRules {
 
     fun match(fields: Map<Int, String>): ConversationMatch? {
         val app = fields[0].orEmpty()
+        if (app == INSTAGRAM) {
+            // Observed Instagram group layout: title=sender, subtitle=group.
+            // Group identity must not include the sender, or each participant gets a card.
+            val sender = fields[1].orEmpty().trim()
+            val group = fields[2].orEmpty().trim()
+            if (!usableLabel(sender, app) || fields[3].orEmpty().isBlank()) return null
+            if (group.isNotBlank()) return ConversationMatch(
+                ConversationContext(app, "instagram-group-subtitle", listOf(group)), group, sender)
+            return ConversationMatch(ConversationContext(app, "instagram-direct-sender", listOf(sender)),
+                sender, sender, isGroup = false)
+        }
         if (app == MESSAGES) {
             // Observed iMessage named-group layout on this iPhone: title=sender, subtitle=group.
             // This is a visible-label key, not the unexposed iOS thread identifier.
@@ -89,7 +101,7 @@ object AncsConversationRules {
     }
 }
 
-data class AncsCardMessage(val uid: Long, val sender: String?, val text: String, val timestamp: Instant)
+data class AncsCardMessage(val uid: Long, val sender: String?, val text: String, val timestamp: Instant, val category: Int = -1)
 data class AncsCard(
     val tag: String,
     val app: String,
@@ -118,7 +130,7 @@ class AncsConversationStore(private val maxCards: Int = Int.MAX_VALUE, private v
         val before = if (trackChanges) snapshot().associateBy { it.tag } else emptyMap()
         val previous = entries.remove(event.uid)
         val sourceApp = fields[0].orEmpty()
-        val match = appSettings?.let { AncsConversationRules.resolve(fields, it(sourceApp), appName(sourceApp)) }
+        val match = appSettings?.let { AncsConversationRules.resolve(fields, it(sourceApp), appName(sourceApp), event.category) }
             ?: if (appSettings == null) AncsConversationRules.match(fields) else null
         val key = Key(source, match?.context, if (match == null) event.uid else null)
         val app = fields[0].orEmpty().ifBlank { "iPhone" }
@@ -129,7 +141,7 @@ class AncsConversationStore(private val maxCards: Int = Int.MAX_VALUE, private v
             LocalDateTime.parse(fields[5].orEmpty(), dateFormat).atZone(ZoneId.systemDefault()).toInstant()
         }.getOrNull() ?: previous?.message?.timestamp ?: if (event.flags and 4 != 0) Instant.EPOCH else now
         entries[event.uid] = Entry(key, app, title, match?.isGroup == true,
-            AncsCardMessage(event.uid, match?.sender, body.ifBlank { "Notification preview unavailable" }, timestamp))
+            AncsCardMessage(event.uid, match?.sender, body.ifBlank { "Notification preview unavailable" }, timestamp, event.category))
         if (key !in tags) tags[key] = stableTag(key)
         // Tags remain stable when adding another sender. Retention uses notification time,
         // because the iPhone can replay its backlog in an arbitrary order.

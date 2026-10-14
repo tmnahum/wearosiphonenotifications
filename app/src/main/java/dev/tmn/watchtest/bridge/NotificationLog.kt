@@ -13,7 +13,14 @@ class NotificationLog(file: File) {
             app TEXT NOT NULL, title TEXT NOT NULL, subtitle TEXT NOT NULL,
             body TEXT NOT NULL, posted_at TEXT NOT NULL, pre_existing INTEGER NOT NULL)""")
         execSQL("CREATE INDEX IF NOT EXISTS notification_log_time ON notification_log(observed_at)")
-        version = 1
+        if (version < 2) {
+            beginTransaction()
+            try {
+                execSQL("ALTER TABLE notification_log ADD COLUMN category INTEGER NOT NULL DEFAULT -1")
+                version = 2
+                setTransactionSuccessful()
+            } finally { endTransaction() }
+        }
     }
     private var lastPruned = Long.MIN_VALUE
     fun append(event: AncsProtocol.Event, fields: Map<Int, String>, now: Long) {
@@ -21,6 +28,7 @@ class NotificationLog(file: File) {
         db.insertOrThrow("notification_log", null, ContentValues().apply {
             put("observed_at", now)
             put("event_kind", event.eventId)
+            put("category", event.category)
             put("app", fields[0].orEmpty())
             put("title", fields[1].orEmpty())
             put("subtitle", fields[2].orEmpty())

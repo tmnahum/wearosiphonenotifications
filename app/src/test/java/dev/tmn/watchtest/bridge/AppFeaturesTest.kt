@@ -93,11 +93,11 @@ class AppFeaturesTest {
         assertEquals(2, history.cardCount)
     }
     @Test fun regroupingRetainsAllRecordsAndSessionUidEdits() {
-        val catalog = AppCatalog()
+        val catalog = AppCatalog().apply { settings("com.google.Gmail", AppSettings(grouping = Grouping.CONVERSATION)) }
         val history = NotificationHistory(catalog).apply { beginSession("phone") }
         history.upsert(event(1), fields("com.google.Gmail", "Alex", "One"), now)
         history.upsert(event(2), fields("com.google.Gmail", "Sam", "Two") + (2 to "Subject"), now)
-        catalog.settings("com.google.Gmail", AppSettings(Delivery.MUTED, Grouping.APP))
+        catalog.settings("com.google.Gmail", AppSettings(grouping = Grouping.APP, hidden = true))
         val changes = history.regroup()
         assertEquals(2, changes.removed.size)
         assertEquals(1, history.cardCount)

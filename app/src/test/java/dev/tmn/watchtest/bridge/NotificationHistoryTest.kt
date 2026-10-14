@@ -88,7 +88,7 @@ class NotificationHistoryTest {
         assertEquals(setOf(history.snapshot().single().tag), history.remove(2).removed)
         assertEquals(2, history.saved().size)
     }
-    @Test fun watchDismissalClearsConversationAndSuppressesReplayAcrossRestart() {
+    @Test fun explicitConversationDeletionSuppressesReplayAcrossRestart() {
         val history = history()
         history.upsert(event(1), fields(), now)
         history.clearConversation(history.snapshot().single().tag)

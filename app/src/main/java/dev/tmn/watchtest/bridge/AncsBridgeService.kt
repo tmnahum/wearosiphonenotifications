@@ -79,7 +79,7 @@ class AncsBridgeService : Service() {
         registerReceiver(appReceiver, IntentFilter(HistoryRepository.EVENT_APPS), RECEIVER_NOT_EXPORTED)
         // A killed/replaced process cannot keep ANCS session identifiers alive.
         notifications.activeNotifications.filter { it.tag?.startsWith("ancs:") == true }
-            .forEach { notifications.cancel(it.tag, it.id) }
+            .forEach { repository.cancelNative(it.tag!!, it.id) }
     }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -315,14 +315,16 @@ class AncsBridgeService : Service() {
         processNext()
     }
     private fun renderChanges(changes: AncsCardChanges, silent: Boolean) {
-        changes.removed.forEach { notifications.cancel(it, 0) }
+        repository.reconcileDismissals()
+        changes.removed.forEach { repository.cancelNative(it) }
         if (!notifications.areNotificationsEnabled()) return
         notifications.createNotificationChannel(NotificationChannel(MESSAGES, "iPhone notifications", NotificationManager.IMPORTANCE_HIGH))
         notifications.createNotificationChannel(NotificationChannel(SILENT_MESSAGES, "Silent iPhone notifications", NotificationManager.IMPORTANCE_LOW))
-        changes.updated.forEach { card ->
+        changes.updated.forEach { candidate ->
+            val card = conversations.notificationCard(candidate) ?: return@forEach
             val app = repository.catalog.get(card.app)
-            if (app.settings.delivery == Delivery.MUTED) {
-                notifications.cancel(card.tag, 0)
+            if (app.settings.hidden) {
+                repository.cancelNative(card.tag)
                 return@forEach
             }
             val latest = card.messages.last()
@@ -333,27 +335,43 @@ class AncsBridgeService : Service() {
                 val oldest = visible.filter { it.tag?.startsWith("ancs:") == true }
                     .minByOrNull { it.notification.`when` }
                 if (oldest == null || oldest.notification.`when` >= latest.timestamp.toEpochMilli()) return@forEach
-                notifications.cancel(oldest.tag, oldest.id)
+                repository.cancelNative(oldest.tag!!, oldest.id)
             }
             val builder = NotificationCompat.Builder(this, if (app.settings.delivery == Delivery.SILENT) SILENT_MESSAGES else MESSAGES)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle(if (card.title == card.app) app.name else card.title).setContentText(latest.text)
                 .setSubText(app.name)
                 .setContentIntent(openApp()).setAutoCancel(false)
-                .setDeleteIntent(HistoryDismissReceiver.pendingIntent(this, card.tag))
+                .addAction(0, "App settings", openAppSettings(card.app))
+                .setDeleteIntent(HistoryDismissReceiver.pendingIntent(this, card.tag, card.messages.maxOf { it.uid }))
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
                 .setWhen(latest.timestamp.toEpochMilli()).setShowWhen(true)
                 .setSilent(silent || app.settings.delivery == Delivery.SILENT)
-            if (card.conversation) {
-                val style = NotificationCompat.MessagingStyle(Person.Builder().setName("You").build())
-                    .setConversationTitle(card.title).setGroupConversation(card.isGroupConversation)
-                card.messages.takeLast(NotificationCompat.MessagingStyle.MAXIMUM_RETAINED_MESSAGES).forEach { message ->
-                    style.addMessage(message.text, message.timestamp.toEpochMilli(),
-                        Person.Builder().setName(message.sender ?: "Sender unavailable").build())
+            when (NotificationPresentation.resolve(app.settings.displayStyle, latest.category, card.app)) {
+                DisplayStyle.MESSAGES -> {
+                    val style = NotificationCompat.MessagingStyle(Person.Builder().setName("You").build())
+                        .setGroupConversation(card.isGroupConversation)
+                    if (card.isGroupConversation) style.setConversationTitle(card.title)
+                    card.messages.takeLast(NotificationCompat.MessagingStyle.MAXIMUM_RETAINED_MESSAGES).forEach { message ->
+                        style.addMessage(message.text, message.timestamp.toEpochMilli(),
+                            Person.Builder().setName(message.sender ?: card.title.ifBlank { app.name }).build())
+                    }
+                    builder.setStyle(style).setCategory(NotificationCompat.CATEGORY_MESSAGE)
                 }
-                builder.setStyle(style).setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            } else builder.setStyle(NotificationCompat.BigTextStyle().bigText(latest.text))
+                DisplayStyle.INBOX -> {
+                    val style = NotificationCompat.InboxStyle()
+                        .setBigContentTitle(if (card.title == card.app) app.name else card.title)
+                        .setSummaryText("${card.messages.size} ${if (card.messages.size == 1) "notification" else "notifications"}")
+                    card.messages.takeLast(7).forEach {
+                        style.addLine(NotificationPresentation.itemText(it).replace('\n', ' ').take(512))
+                    }
+                    builder.setStyle(style).setCategory(NotificationCompat.CATEGORY_EMAIL)
+                }
+                DisplayStyle.TEXT, DisplayStyle.AUTOMATIC -> builder.setStyle(
+                    NotificationCompat.BigTextStyle().bigText(NotificationPresentation.expandedText(card.messages)))
+            }
             notifications.notify(card.tag, 0, builder.build())
+            repository.nativePosted(card)
             AncsDiagnostics.posted++
         }
     }
@@ -411,6 +429,13 @@ class AncsBridgeService : Service() {
         // Keep live diagnostics in the app; reposting the service card bumps its tray ranking.
     }
     private fun send(action: String) { sendBroadcast(Intent(action).setPackage(packageName)) }
+    private fun openAppSettings(app: String) = PendingIntent.getActivity(this, 0,
+        Intent(this, MainActivity::class.java)
+            .setData(android.net.Uri.Builder().scheme("iphone-connection").authority("app-settings").appendPath(app).build())
+            .putExtra(MainActivity.EXTRA_APP_SETTINGS, app)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
     private fun openApp() = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     private fun foregroundNotification(): Notification {
@@ -431,6 +456,7 @@ class AncsBridgeService : Service() {
     override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
         writer.println("ANCS ready=$ready events=${AncsDiagnostics.events} received=${AncsDiagnostics.received} posted=${AncsDiagnostics.posted} queued=${session.pendingCount} inFlight=${session.current != null || appRequest != null} cards=${conversations.cardCount} conversations=${conversations.conversationCount}")
         writer.println("Status: ${AncsDiagnostics.status}")
+        writer.println("Tray dismissed records=${conversations.saved().count { it.trayDismissed }}")
         writer.println("Apps known=${repository.catalog.all().size} named=${repository.catalog.all().count { it.displayName.isNotBlank() }} phase=${AncsDiagnostics.phase}")
         writer.println("Storage loaded=${repository.loaded} saveError=${repository.error != null} logError=${repository.logError != null}")
         if (args?.firstOrNull() == "layout") {
