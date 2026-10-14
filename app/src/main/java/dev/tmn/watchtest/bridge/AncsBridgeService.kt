@@ -276,7 +276,7 @@ class AncsBridgeService : Service() {
             return
         }
         val event = session.next() ?: return
-        armTimeout("Notification response timed out. Reconnect to start a fresh session.")
+        armTimeout("Notification response timed out. Reconnecting…", retry = true)
         val status = client.writeCharacteristic(characteristic, AncsProtocol.getNotificationAttributes(event.uid),
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
         if (status != BluetoothStatusCodes.SUCCESS)

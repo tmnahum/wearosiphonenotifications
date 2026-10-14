@@ -1,5 +1,11 @@
 # Pixel Watch / iPhone notification bridge handoff
 
+## Code review follow-up — 2026-10-14
+
+Notification attribute response timeouts now use the existing automatic reconnect path (`retry = true`) instead of leaving reception stopped in ERROR. All 72 JVM tests, assembleDebug and lintDebug pass. Not installed or device-tested.
+
+Dismissal review finding remains unfixed, per requested scope. Narrowed with a synthetic host reproduction using the actual history/catalog/tracker classes and the repository's operation order: swipe within the one-second posting grace window, automatic app-name resolution changes grouping/tag before the delete callback, reconciliation skips the recent post, programmatic cancellation forgets the old tag, then the delayed callback finds no matching conversation. Record stays eligible for reposting. Control cases after the grace window or without regrouping correctly dismiss it. This confirms a code-level timing race, not observed Wear callback timing or frequency. The initial isolated reproduction omitted reconciliation; ordinary older-card dismissals are protected by that check.
+
 Updated 2026-10-14. Working directory `/home/tmn/code/watch`, branch `feature/ancs-chat-preview`, baseline `e1b79ea`. Implementation remains uncommitted. No remote or PR. No sub-agents used.
 
 ## Combined notification delivery setting — 2026-10-14
