@@ -48,6 +48,7 @@ class AncsBridgeService : Service() {
     private var gatt: BluetoothGatt? = null
     private var control: BluetoothGattCharacteristic? = null
     private var subscribing: UUID? = null
+    private var foregroundStarted = false
     private var ready = false
     private var timeout: Runnable? = null
     private var reconnectTask: Runnable? = null
@@ -55,7 +56,9 @@ class AncsBridgeService : Service() {
     private var selectedAddress: String? = null
     private var retryAttempt = 0
     private val session = AncsSession(capacity = 512)
-    private val conversations = AncsConversationStore()
+    private val repository by lazy { HistoryRepository.get(this) }
+    private val conversations get() = repository.history
+    private var destroyed = false
 
     override fun onCreate() {
         super.onCreate()
@@ -65,23 +68,34 @@ class AncsBridgeService : Service() {
     }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, foregroundNotification(AncsDiagnostics.status))
+        if (!foregroundStarted) {
+            startForeground(NOTIFICATION_ID, foregroundNotification())
+            foregroundStarted = true
+        }
+        repository.whenReady {
+            if (!destroyed) handleCommand(intent)
+        }
+        return START_NOT_STICKY
+    }
+    private fun handleCommand(intent: Intent?) {
         try {
             when (intent?.action) {
                 ACTION_SCAN -> listPairedDevices()
                 ACTION_CONNECT -> intent.getStringExtra(EXTRA_ADDRESS)?.let { connect(it) }
                 ACTION_DISCONNECT -> {
                     selectedAddress = null
+                    AncsDiagnostics.running = false
+                    AncsDiagnostics.problem = false
                     closeSession()
                     publishState("Disconnected")
                     stopForeground(STOP_FOREGROUND_REMOVE)
+                    foregroundStarted = false
                     stopSelf()
                 }
             }
         } catch (_: SecurityException) { fail("Bluetooth permission is required.") }
-        return START_NOT_STICKY
     }
-    override fun onDestroy() { selectedAddress = null; closeSession(); super.onDestroy() }
+    override fun onDestroy() { destroyed = true; AncsDiagnostics.running = false; selectedAddress = null; closeSession(); repository.flush(); super.onDestroy() }
 
     private fun listPairedDevices() {
         AncsDiagnostics.devices.clear()
@@ -102,8 +116,12 @@ class AncsBridgeService : Service() {
         val device = bluetooth.adapter?.bondedDevices?.firstOrNull { it.address == address }
         if (device == null) { publishState("Select an existing paired device; automatic pairing is disabled."); return }
         selectedAddress = address
+        AncsDiagnostics.running = true
+        AncsDiagnostics.problem = false
         if (!retry) retryAttempt = 0
         closeSession()
+        conversations.beginSession(address)
+        getSharedPreferences("relay", MODE_PRIVATE).edit().putString("phone", address).apply()
         publishState("Connecting to paired iPhone…")
         // This overload delivers callbacks on the same looper as service/UI state.
         gatt = device.connectGatt(this, retry, callback, BluetoothDevice.TRANSPORT_LE,
@@ -143,6 +161,7 @@ class AncsBridgeService : Service() {
             } else {
                 subscribing = null
                 ready = true
+                AncsDiagnostics.connected = true
                 retryAttempt = 0
                 cancelTimeout()
                 publishState("ANCS connected. Waiting for iPhone notifications.")
@@ -226,6 +245,7 @@ class AncsBridgeService : Service() {
         cancelTimeout()
         session.finish()?.let { result ->
             AncsDiagnostics.received++
+            repository.recordNotification(result.event, result.fields)
             AncsDiagnostics.recordLayout(result.event.uid, result.fields)
             val labels = listOf("App identifier", "Title", "Subtitle", "Message", "Message size", "Date", "Positive action", "Negative action")
             val record = labels.mapIndexed { id, name -> "$name: ${result.fields[id].orEmpty()}" }.joinToString("\n") +
@@ -233,6 +253,7 @@ class AncsBridgeService : Service() {
             AncsDiagnostics.record(result.event.uid, record)
             renderChanges(conversations.upsert(result.event, result.fields, Instant.now()),
                 silent = result.event.flags and 5 != 0 || result.event.eventId == AncsProtocol.EVENT_MODIFIED)
+            repository.changed()
             publishState("Receiving iPhone notifications: ${AncsDiagnostics.received} received, ${AncsDiagnostics.posted} posted.")
             send(EVENT_FIELDS)
         }
@@ -244,6 +265,15 @@ class AncsBridgeService : Service() {
         notifications.createNotificationChannel(NotificationChannel(MESSAGES, "iPhone notifications", NotificationManager.IMPORTANCE_HIGH))
         changes.updated.forEach { card ->
             val latest = card.messages.last()
+            // Android rejects posts once an app fills its notification quota. Keep room
+            // for the foreground card/system summary, without deleting saved history.
+            val visible = notifications.activeNotifications
+            if (visible.none { it.tag == card.tag } && visible.size >= 48) {
+                val oldest = visible.filter { it.tag?.startsWith("ancs:") == true }
+                    .minByOrNull { it.notification.`when` }
+                if (oldest == null || oldest.notification.`when` >= latest.timestamp.toEpochMilli()) return@forEach
+                notifications.cancel(oldest.tag, oldest.id)
+            }
             val builder = NotificationCompat.Builder(this, MESSAGES)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle(card.title).setContentText(latest.text)
@@ -253,14 +283,15 @@ class AncsBridgeService : Service() {
                     "org.whispersystems.signal" -> "Signal"
                     else -> card.app
                 })
-                .setContentIntent(openApp()).setAutoCancel(true)
+                .setContentIntent(openApp()).setAutoCancel(false)
+                .setDeleteIntent(HistoryDismissReceiver.pendingIntent(this, card.tag))
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
                 .setWhen(latest.timestamp.toEpochMilli()).setShowWhen(true)
                 .setSilent(silent)
             if (card.conversation) {
                 val style = NotificationCompat.MessagingStyle(Person.Builder().setName("You").build())
                     .setConversationTitle(card.title).setGroupConversation(card.isGroupConversation)
-                card.messages.forEach { message ->
+                card.messages.takeLast(NotificationCompat.MessagingStyle.MAXIMUM_RETAINED_MESSAGES).forEach { message ->
                     style.addMessage(message.text, message.timestamp.toEpochMilli(),
                         Person.Builder().setName(message.sender ?: "Sender unavailable").build())
                 }
@@ -285,11 +316,12 @@ class AncsBridgeService : Service() {
         gatt = null // Ignore callbacks from the old client, including disconnects.
         try { old?.disconnect(); old?.close() } catch (_: SecurityException) { }
         ready = false
+        AncsDiagnostics.connected = false
         control = null
         subscribing = null
         session.clear()
-        conversations.snapshot().forEach { notifications.cancel(it.tag, 0) }
-        conversations.clear()
+        conversations.endSession()
+        repository.flush()
         AncsDiagnostics.clearSession()
         send(EVENT_FIELDS)
     }
@@ -307,25 +339,38 @@ class AncsBridgeService : Service() {
                     catch (_: SecurityException) { fail("Bluetooth permission is required.") }
                 }
             }.also { handler.postDelayed(it, delay) }
-        } else publishState(message)
+        } else {
+            AncsDiagnostics.problem = true
+            publishState(message)
+        }
     }
     private fun publishState(message: String) {
         AncsDiagnostics.status = message
         send(EVENT_STATE)
-        notifications.notify(NOTIFICATION_ID, foregroundNotification(message))
+        // Keep live diagnostics in the app; reposting the service card bumps its tray ranking.
     }
     private fun send(action: String) { sendBroadcast(Intent(action).setPackage(packageName)) }
     private fun openApp() = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-    private fun foregroundNotification(text: String): Notification {
+    private fun foregroundNotification(): Notification {
         notifications.createNotificationChannel(NotificationChannel(CHANNEL, "iPhone bridge status", NotificationManager.IMPORTANCE_LOW))
         return NotificationCompat.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("iPhone bridge").setContentText(text).setContentIntent(openApp()).setOngoing(true).build()
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText("Service running · Tap for connection status")
+            .setContentIntent(openApp())
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setSilent(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setOngoing(true)
+            .build()
     }
     /** Safe ADB diagnostics: deliberately excludes notification fields and device addresses. */
     override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
         writer.println("ANCS ready=$ready events=${AncsDiagnostics.events} received=${AncsDiagnostics.received} posted=${AncsDiagnostics.posted} queued=${session.pendingCount} inFlight=${session.current != null} cards=${conversations.cardCount} conversations=${conversations.conversationCount}")
         writer.println("Status: ${AncsDiagnostics.status}")
+        writer.println("Storage loaded=${repository.loaded} saveError=${repository.error != null} logError=${repository.logError != null}")
         if (args?.firstOrNull() == "layout") {
             val query = args.drop(1).joinToString(" ").trim()
             if (query.isNotBlank()) AncsDiagnostics.describeLayouts(query).forEach(writer::println)

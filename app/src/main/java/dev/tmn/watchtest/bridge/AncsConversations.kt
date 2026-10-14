@@ -5,7 +5,7 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
-/** Display-context grouping, not an iOS thread ID. Scoped to one ANCS connection. */
+/** Display-context grouping, not an iOS thread ID. Keys are display-label heuristics. */
 data class ConversationContext(val app: String, val rule: String, val labels: List<String>)
 data class ConversationMatch(val context: ConversationContext, val title: String, val sender: String, val isGroup: Boolean = true)
 
@@ -59,23 +59,22 @@ data class AncsCard(
 )
 data class AncsCardChanges(val updated: List<AncsCard>, val removed: Set<String>)
 
-/** Bounded active-notification model. UIDs identify messages, including edits/removals. */
-class AncsConversationStore(private val maxCards: Int = 32, private val maxMessages: Int = 8) {
+/** Conversation model with optional bounds. The history adapter supplies durable local IDs. */
+class AncsConversationStore(private val maxCards: Int = Int.MAX_VALUE, private val maxMessages: Int = Int.MAX_VALUE) {
     init { require(maxCards > 0 && maxMessages > 0) }
-    private data class Key(val context: ConversationContext?, val singleUid: Long?)
+    private data class Key(val source: String, val context: ConversationContext?, val singleUid: Long?)
     private data class Entry(val key: Key, val app: String, val title: String, val isGroup: Boolean, val message: AncsCardMessage)
     private val entries = linkedMapOf<Long, Entry>()
     private val tags = linkedMapOf<Key, String>()
-    private var nextTag = 0L
     val conversationCount get() = tags.keys.count { it.context != null }
     val cardCount get() = tags.size
     private val dateFormat = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss")
 
-    fun upsert(event: AncsProtocol.Event, fields: Map<Int, String>, now: Instant): AncsCardChanges {
-        val before = snapshot().associateBy { it.tag }
+    fun upsert(event: AncsProtocol.Event, fields: Map<Int, String>, now: Instant, source: String = "", trackChanges: Boolean = true): AncsCardChanges {
+        val before = if (trackChanges) snapshot().associateBy { it.tag } else emptyMap()
         val previous = entries.remove(event.uid)
         val match = AncsConversationRules.match(fields)
-        val key = Key(match?.context, if (match == null) event.uid else null)
+        val key = Key(source, match?.context, if (match == null) event.uid else null)
         val app = fields[0].orEmpty().ifBlank { "iPhone" }
         val title = match?.title ?: fields[1].orEmpty().ifBlank { app }
         val body = if (match != null) fields[3].orEmpty() else
@@ -85,14 +84,15 @@ class AncsConversationStore(private val maxCards: Int = 32, private val maxMessa
         }.getOrNull() ?: previous?.message?.timestamp ?: if (event.flags and 4 != 0) Instant.EPOCH else now
         entries[event.uid] = Entry(key, app, title, match?.isGroup == true,
             AncsCardMessage(event.uid, match?.sender, body.ifBlank { "Notification preview unavailable" }, timestamp))
-        if (key !in tags) tags[key] = "ancs:card:${nextTag++}"
+        if (key !in tags) tags[key] = stableTag(key)
         // Tags remain stable when adding another sender. Retention uses notification time,
         // because the iPhone can replay its backlog in an arbitrary order.
         val tag = tags.remove(key)!!
         tags[key] = tag
-        entries.values.filter { it.key == key }.sortedBy { it.message.timestamp }
-            .dropLast(maxMessages).forEach { entries.remove(it.message.uid) }
-        pruneEmptyKeys()
+        if (maxMessages != Int.MAX_VALUE) {
+            entries.values.filter { it.key == key }.sortedBy { it.message.timestamp }
+                .dropLast(maxMessages).forEach { entries.remove(it.message.uid) }
+        }
         while (tags.size > maxCards) {
             val oldest = tags.keys.minBy { candidate ->
                 entries.values.filter { it.key == candidate }.maxOfOrNull { it.message.timestamp } ?: Instant.MIN
@@ -100,27 +100,40 @@ class AncsConversationStore(private val maxCards: Int = 32, private val maxMessa
             entries.entries.removeAll { it.value.key == oldest }
             tags.remove(oldest)
         }
-        pruneEmptyKeys()
-        return changes(before)
+        if (previous != null || maxMessages != Int.MAX_VALUE || maxCards != Int.MAX_VALUE) pruneEmptyKeys()
+        return if (trackChanges) changes(before) else AncsCardChanges(emptyList(), emptySet())
     }
 
-    fun remove(uid: Long): AncsCardChanges {
+    fun remove(uid: Long): AncsCardChanges = removeAll(setOf(uid))
+
+    fun removeAll(uids: Set<Long>): AncsCardChanges {
         val before = snapshot().associateBy { it.tag }
-        entries.remove(uid)
+        entries.keys.removeAll(uids)
         pruneEmptyKeys()
         return changes(before)
     }
 
-    fun snapshot(): List<AncsCard> = tags.mapNotNull { (key, tag) ->
-        val members = entries.values.filter { it.key == key }.sortedBy { it.message.timestamp }
+    fun snapshot(): List<AncsCard> {
+        val grouped = entries.values.groupBy { it.key }
+        return tags.mapNotNull { (key, tag) ->
+        val members = grouped[key].orEmpty().sortedBy { it.message.timestamp }
         val latest = members.lastOrNull() ?: return@mapNotNull null
         AncsCard(tag, latest.app, latest.title, key.context != null, latest.isGroup, members.map { it.message })
     }
 
+    }
+
+    private fun stableTag(key: Key): String {
+        val values = listOf(key.source, key.context?.app.orEmpty(), key.context?.rule.orEmpty()) +
+            (key.context?.labels ?: listOf(key.singleUid.toString()))
+        val bytes = values.joinToString("") { "${it.length}:$it" }.toByteArray(Charsets.UTF_8)
+        return "ancs:card:" + java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { (it.toInt() and 255).toString(16).padStart(2, '0') }
+    }
     private fun pruneEmptyKeys() { tags.keys.retainAll(entries.values.map { it.key }.toSet()) }
     private fun changes(before: Map<String, AncsCard>): AncsCardChanges {
         val after = snapshot().associateBy { it.tag }
         return AncsCardChanges(after.values.filter { before[it.tag] != it }, before.keys - after.keys)
     }
-    fun clear() { entries.clear(); tags.clear(); nextTag = 0 }
+    fun clear() { entries.clear(); tags.clear() }
 }

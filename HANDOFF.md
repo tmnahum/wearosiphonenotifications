@@ -2,6 +2,29 @@
 
 Updated 2026-10-13. Working directory `/home/tmn/code/watch`, branch `feature/ancs-chat-preview`, baseline `e1b79ea`. Implementation remains uncommitted. No remote or PR. No sub-agents used.
 
+## Latest update — iPhone Connection UI and local storage (supersedes older session-only descriptions below)
+
+User requested a quiet connection notification, persistent history with reconnect/backlog deduplication, and a user-oriented UI. They explicitly rejected message-count limits and chose **watch dismissal only** to reset saved conversation history; iPhone dismissal preserves it. They also requested a separate **14-day local notification log**, with **no archive UI yet**.
+
+Implemented:
+- Static silent low-importance foreground card, posted once per service instance; live status stays in the app. That intermediate status-only APK installed successfully. The combined build is now installed; see live verification below.
+- App label **iPhone Connection**, existing package unchanged. Home shows connection and recent conversations; connection selection/reconnect/disconnect, notification settings, clear-all-data and content-free diagnostics are separate screens. Test controls/raw field dump removed from UI. Native watch-sized controls and paged conversation views.
+- Uncapped local conversation model, source-scoped keys, stable hashed notification tags. Native notification renderer takes last 25 messages (platform MessagingStyle capacity); saved history is not capped.
+- `NotificationHistory.kt`: durable local IDs, transient per-session UID mappings, one-for-one app/title/subtitle/body/date replay matching, fresh-event duplicates preserved, watch-dismissal clears conversation and persists only suppression fingerprints. iPhone removals cancel the last active card but retain collected history. Missing dates/changed content across sessions remain best-effort limitations.
+- `HistoryRepository.kt`: private no-backup AtomicFile, versioned validated codec, asynchronous restore and serial/coalesced writes. `HistoryDismissReceiver` handles native watch swipe/clear-all through explicit unexported delete intents and waits for persistence. Tapping cards no longer auto-cancels them.
+- `NotificationLog.kt`: private SQLite received-observation archive, 14-day retention by local receipt time; startup/activity/write/hourly cleanup. No archive browser. Stopped processes clean up on next start. Watch dismissal preserves log; Clear all local data deletes conversations and log. Dated replay-suppression hashes are retained so cleared phone backlog does not immediately recreate history.
+- 38 JVM tests pass, assemble and lint pass (0 errors, 4 warnings). Persistence/replay/UID reuse/duplicates/phone isolation/clearing/codec tests use synthetic content only. Long-run uncapped history scaling and real swipe callbacks still need device verification.
+
+Device recovery and live verification (2026-10-13 evening): user force-rebooted the watch and re-enabled wireless debugging. Cause of prior black screen remains unknown. mDNS rediscovered `192.168.0.162:34587`; use serial `adb-32281JEEJW01G0-VPWAI6._adb-tls-connect._tcp`. Bridge confirmed disabled-user. Combined app installed successfully and app UI opened. Real reception completed an initial 292-event backlog. App-private history contained 292 records; a subsequent new notification made 293. After restart/reconnect replay, the 293-record snapshot checksum remained unchanged, verifying deduplication and persistence for this sample. No private fields were printed or saved on the host; snapshots were inspected only in memory for counts/checksums.
+
+Device testing caught SQLite initialization failing because `execSQL(PRAGMA secure_delete=ON)` returns a result; fixed it to `rawQuery(...).use { moveToFirst() }`. The corrected app wrote archive rows (204 observed during replay), and service diagnostics reported loaded=true, saveError=false, logError=false. Added content-free storage flags to service dump.
+
+Android caps outstanding app notifications; the service now avoids filling the tray with old backlog cards by evicting the oldest visible relay card before admitting a newer one when there are already 48 app cards (reserves system headroom). History is not deleted by this programmatic cancellation. Native cards still contain only the latest 25 messages; saved conversation history has no count cap.
+
+Restore was slow on the watch. Optimized bulk reconstruction to avoid per-record full-model diff/retention scans and replaced per-byte String.format hashing. All 38 tests/build/lint passed again. The final performance-fix APK installed successfully. Final receiver verified ready=true, receiving replay (74/291 at the check), loaded=true, saveError=false, logError=false. Native notification inspection found 47 relayed cards, including 12 MessagingStyle conversation cards. The status card title is iPhone Connection and its creation/update timestamps remained unchanged while new cards arrived. The receiver is left running. Real swipe-dismissal and extended reliability still need verification.
+
+No personal notification fields or webhook secret saved to the repository or printed. App-private notification persistence is now explicitly user-requested. Earlier notes saying no on-disk content or session-only retention are historical.
+
 ## Standing device instruction
 
 The user explicitly requested remembering to disable Bridge before ANCS work. See `AGENTS.md`: verify `com.orienlabs.bridge.wear` is disabled-user before connecting/testing our receiver; force-stop alone was insufficient. Keep it installed, preserve its bonds/data, and leave disabled unless the user requests switching back.

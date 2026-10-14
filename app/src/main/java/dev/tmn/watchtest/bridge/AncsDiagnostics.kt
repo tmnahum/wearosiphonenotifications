@@ -2,6 +2,9 @@ package dev.tmn.watchtest.bridge
 
 /** Main-thread, process-local state. No notification text is written to disk or logs. */
 object AncsDiagnostics {
+    var problem = false
+    var connected = false
+    var running = false
     var status = "No active iPhone connection."
     val records = ArrayDeque<Pair<Long, String>>()
     val devices = linkedMapOf<String, String>()

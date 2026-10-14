@@ -1,17 +1,19 @@
 package dev.tmn.watchtest
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
-import androidx.core.app.NotificationCompat
-import android.app.NotificationChannel
+import android.app.AlertDialog
 import android.app.NotificationManager
-import android.app.PendingIntent
-import android.content.Intent
+import android.bluetooth.BluetoothManager
 import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
 import android.content.IntentFilter
-import android.os.Build
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
@@ -19,250 +21,302 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import java.text.DateFormat
-import java.time.Instant
-import java.util.Date
-import dev.tmn.watchtest.bridge.BridgeMessage
-import dev.tmn.watchtest.bridge.ConversationPreviews
 import dev.tmn.watchtest.bridge.AncsBridgeService
+import dev.tmn.watchtest.bridge.AncsCard
+import dev.tmn.watchtest.bridge.AncsConversationRules
 import dev.tmn.watchtest.bridge.AncsDiagnostics
+import dev.tmn.watchtest.bridge.HistoryRepository
+import java.text.DateFormat
+import java.util.Date
 
+/** Small, scrollable native screens with large touch targets for a round watch. */
 class MainActivity : Activity() {
+    private val repository by lazy { HistoryRepository.get(this) }
+    private val preferences by lazy { getSharedPreferences("relay", MODE_PRIVATE) }
     private val notifications get() = getSystemService(NotificationManager::class.java)
-    private lateinit var status: TextView
-    private lateinit var bridgeStatus: TextView
-    private lateinit var deviceList: LinearLayout
-    private lateinit var fieldsView: TextView
-    private var renderedDevices: Map<String, String>? = null
-    private var receiverRegistered = false
-    private var lastStatus: String? = null
+    private lateinit var content: LinearLayout
+    private var statusView: TextView? = null
+    private var connectionButton: Button? = null
+    private var historyList: LinearLayout? = null
+    private var renderedCards: List<AncsCard>? = null
+    private var renderedHistoryLoaded = false
+    private var screen = "home"
+    private var visibleMessages = 50
+    private var visibleConversations = 20
+    private var selectedTag: String? = null
+    private var permissionAction: (() -> Unit)? = null
+    private var registered = false
+    private val accent = Color.rgb(130, 230, 205)
+    private val muted = Color.rgb(177, 186, 194)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        notifications.createNotificationChannel(
-            NotificationChannel(CHANNEL, getString(R.string.channel_name), NotificationManager.IMPORTANCE_HIGH).apply {
-                description = getString(R.string.channel_description)
-                enableVibration(true)
-            }
-        )
-        lastStatus = savedInstanceState?.getString("status")
-        val content = LinearLayout(this).apply {
+        onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT) { navigateBack() }
+        showHome()
+        repository.whenReady { if (!isDestroyed) refresh() }
+    }
+    override fun onResume() {
+        super.onResume()
+        repository.pruneLog()
+        if (!registered) {
+            registerReceiver(receiver, IntentFilter().apply {
+                addAction(AncsBridgeService.EVENT_STATE)
+                addAction(AncsBridgeService.EVENT_FIELDS)
+                addAction(HistoryRepository.EVENT_HISTORY)
+            }, RECEIVER_NOT_EXPORTED)
+            registered = true
+        }
+        refresh()
+    }
+    override fun onPause() {
+        if (registered) { unregisterReceiver(receiver); registered = false }
+        super.onPause()
+    }
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) { refresh() }
+    }
+
+    private fun page(name: String, title: String) {
+        screen = name
+        statusView = null
+        connectionButton = null
+        historyList = null
+        renderedCards = null
+        content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(28), dp(24), dp(36))
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(26), dp(30), dp(26), dp(34))
-        }
-        fun label(text: String, size: Float) = TextView(this).apply {
-            this.text = text
-            textSize = size
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            setPadding(0, dp(4), 0, dp(8))
-            content.addView(this)
-        }
-        fun button(resource: Int, action: () -> Unit) {
-            content.addView(Button(this).apply {
-                setText(resource)
-                isAllCaps = false
-                textSize = 14f
-                minHeight = dp(48)
-                setOnClickListener { action() }
-            }, LinearLayout.LayoutParams(-1, -2))
-        }
-        label(getString(R.string.iphone_bridge_heading), 18f)
-        bridgeStatus = label(getString(R.string.iphone_bridge_ready), 12f).apply { minLines = 3 }
-        button(R.string.scan_iphone) { requestAndScan() }
-        deviceList = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            content.addView(this, LinearLayout.LayoutParams(-1, -2))
-        }
-        button(R.string.disconnect_iphone) { startBridgeService(AncsBridgeService.ACTION_DISCONNECT) }
-        button(R.string.toggle_details) {
-            fieldsView.visibility = if (fieldsView.visibility == android.view.View.VISIBLE) android.view.View.GONE else android.view.View.VISIBLE
-        }
-        fieldsView = TextView(this).apply {
-            visibility = android.view.View.GONE
-            textSize = 11f
-            setTextColor(Color.WHITE)
-            setPadding(0, dp(8), 0, dp(12))
-            content.addView(this, LinearLayout.LayoutParams(-1, -2))
-        }
-        label(getString(R.string.heading), 16f)
-        button(R.string.send) { requestOrSend() }
-        button(R.string.group_preview) { sendGroupPreviewSample() }
-        status = label("", 12f)
-        button(R.string.clear) {
-            notifications.cancel(TEST_ID)
-            notifications.cancel(GROUP_PREVIEW_ID)
-            updateStatus(getString(R.string.cleared))
-        }
-        button(R.string.settings) {
-            startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                .putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
         }
         setContentView(ScrollView(this).apply {
             setBackgroundColor(Color.BLACK)
             isFillViewport = true
             addView(content)
         })
+        label(title, 22f, Color.WHITE, bold = true)
     }
-
-    override fun onResume() {
-        super.onResume()
-        if (!receiverRegistered) {
-            val filter = IntentFilter().apply {
-                addAction(AncsBridgeService.EVENT_DEVICE)
-                addAction(AncsBridgeService.EVENT_STATE)
-                addAction(AncsBridgeService.EVENT_FIELDS)
+    private fun label(text: String, size: Float = 13f, color: Int = muted, bold: Boolean = false,
+                      parent: LinearLayout = content, centered: Boolean = true): TextView = TextView(this).apply {
+        this.text = text
+        textSize = size
+        setTextColor(color)
+        gravity = if (centered) Gravity.CENTER else Gravity.START
+        if (bold) setTypeface(typeface, Typeface.BOLD)
+        setPadding(dp(4), dp(5), dp(4), dp(7))
+        parent.addView(this, LinearLayout.LayoutParams(-1, -2))
+    }
+    private fun button(text: String, primary: Boolean = false, parent: LinearLayout = content, action: () -> Unit): Button {
+        val view = Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            textSize = 14f
+            minHeight = dp(48)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setTextColor(if (primary) Color.BLACK else Color.WHITE)
+            background = GradientDrawable().apply {
+                setColor(if (primary) accent else Color.rgb(35, 40, 45))
+                cornerRadius = dp(24).toFloat()
             }
-            registerReceiver(bridgeReceiver, filter, RECEIVER_NOT_EXPORTED)
-            receiverRegistered = true
+            setOnClickListener { action() }
         }
-        renderBridge()
-        status.text = when {
-            !notifications.areNotificationsEnabled() -> getString(R.string.permission_needed)
-            notifications.getNotificationChannel(CHANNEL).importance == NotificationManager.IMPORTANCE_NONE -> getString(R.string.channel_blocked)
-            else -> lastStatus ?: getString(R.string.ready)
+        parent.addView(view, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6); bottomMargin = dp(4) })
+        return view
+    }
+    private fun showHome() {
+        page("home", getString(R.string.app_name))
+        statusView = label("", 13f, accent).apply { minLines = 2 }
+        connectionButton = button(if (AncsDiagnostics.running) "Connection" else "Connect iPhone", primary = true) {
+            if (AncsDiagnostics.running) showConnection() else connectSaved()
         }
-    }
-
-    override fun onPause() {
-        if (receiverRegistered) {
-            unregisterReceiver(bridgeReceiver)
-            receiverRegistered = false
+        label("Recent conversations", 16f, Color.WHITE, bold = true)
+        historyList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            content.addView(this, LinearLayout.LayoutParams(-1, -2))
         }
-        super.onPause()
+        button("Settings") { showSettings() }
+        refresh()
     }
-
-    private val bridgeReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: android.content.Context?, intent: Intent?) { renderBridge() }
-    }
-
-    private fun renderBridge() {
-        if (bridgeStatus.text.toString() != AncsDiagnostics.status) bridgeStatus.text = AncsDiagnostics.status
-        val records = AncsDiagnostics.records.toList().asReversed().joinToString("\n\n────────\n\n") { it.second }
-        if (fieldsView.text.toString() != records) fieldsView.text = records
-        // Status/field updates must not replace focused buttons or collapse the scroll content.
-        if (renderedDevices == AncsDiagnostics.devices) return
-        renderedDevices = AncsDiagnostics.devices.toMap()
-        deviceList.removeAllViews()
-        AncsDiagnostics.devices.forEach { (address, label) ->
-            deviceList.addView(Button(this).apply {
-                text = getString(R.string.connect_named_device, label)
-                isAllCaps = false
-                setOnClickListener {
-                    startBridgeService(AncsBridgeService.ACTION_CONNECT) {
-                        putExtra(AncsBridgeService.EXTRA_ADDRESS, address)
+    private fun refresh() {
+        when (screen) {
+            "home" -> {
+                connectionButton?.text = if (AncsDiagnostics.running) "Connection" else "Connect iPhone"
+                statusView?.text = when {
+                    !notifications.areNotificationsEnabled() -> "Notifications are off · Enable in Settings"
+                    repository.error != null -> repository.error
+                    AncsDiagnostics.problem -> "Connection needs attention"
+                    AncsDiagnostics.problem -> AncsDiagnostics.status
+        AncsDiagnostics.connected -> "Connected to iPhone"
+                    AncsDiagnostics.running -> "Connecting · Saved chats available"
+                    else -> "Offline · Saved chats available"
+                }
+                val cards = repository.history.snapshot().sortedByDescending { it.messages.last().timestamp }
+                if (renderedCards == cards && renderedHistoryLoaded == repository.loaded) return
+                renderedCards = cards
+                renderedHistoryLoaded = repository.loaded
+                historyList?.let { list ->
+                    list.removeAllViews()
+                    if (cards.isEmpty()) label(if (repository.loaded) "Messages will appear here when your iPhone sends notifications." else "Loading saved conversations…", parent = list)
+                    cards.take(visibleConversations).forEach { card ->
+                        val latest = card.messages.last()
+                        button("${card.title}\n${appName(card.app)} · ${card.messages.size} ${if (card.messages.size == 1) "message" else "messages"}", parent = list) {
+                            selectedTag = card.tag
+                            visibleMessages = 50
+                            showConversation()
+                        }
+                        label(latest.text, 12f, parent = list).apply { maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END }
+                    }
+                    if (cards.size > visibleConversations) button("More conversations", parent = list) {
+                        visibleConversations += 20
+                        renderedCards = null
+                        refresh()
                     }
                 }
-            }, LinearLayout.LayoutParams(-1, -2))
-        }
-    }
-
-    private fun requestAndScan() {
-        val needed = buildList {
-            if (Build.VERSION.SDK_INT >= 31) {
-                if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) add(Manifest.permission.BLUETOOTH_CONNECT)
             }
-            if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                add(Manifest.permission.POST_NOTIFICATIONS)
+            "connection" -> statusView?.text = connectionText()
+            "diagnostics" -> statusView?.text = diagnosticsText()
+            // Do not jump back to the top while someone reads a conversation. The newest
+            // snapshot appears on next open, with an explicit refresh action in the thread.
+        }
+    }
+    private fun showConversation() {
+        val card = repository.history.snapshot().firstOrNull { it.tag == selectedTag }
+        page("conversation", card?.title ?: "Conversation")
+        button("Back") { showHome() }
+        if (card == null) { label("This conversation is no longer saved."); return }
+        label(appName(card.app))
+        if (card.messages.size > visibleMessages) button("Show older messages") {
+            visibleMessages += 50
+            showConversation()
+        }
+        card.messages.takeLast(visibleMessages).forEach { message ->
+            val bubble = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(9), dp(6), dp(9), dp(6))
+                background = GradientDrawable().apply { setColor(Color.rgb(25, 31, 36)); cornerRadius = dp(16).toFloat() }
+                content.addView(this, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(7) })
+            }
+            if (message.sender != null) label(message.sender, 13f, accent, true, bubble, false)
+            label(message.text, 15f, Color.WHITE, parent = bubble, centered = false)
+            label(if (message.timestamp == java.time.Instant.EPOCH) "Time unavailable" else
+                DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date.from(message.timestamp)),
+                10f, parent = bubble, centered = false)
+        }
+        label("Saved from iPhone notifications")
+        button("Refresh") { showConversation() }
+        button("All conversations") { showHome() }
+    }
+    private fun showConnection() {
+        page("connection", "Connection")
+        statusView = label(connectionText(), color = accent)
+        button("Reconnect", primary = true) { connectSaved() }
+        button("Choose paired phone") { withPermissions { showPhones() } }
+        button("Disconnect") {
+            startBridge(AncsBridgeService.ACTION_DISCONNECT)
+            showHome()
+        }
+        label("On your iPhone, enable Share System Notifications in this watch’s Bluetooth settings.")
+        button("Back") { showHome() }
+    }
+    private fun connectionText() = when {
+        AncsDiagnostics.problem -> AncsDiagnostics.status
+        AncsDiagnostics.connected -> "Connected\nNew notifications arrive automatically."
+        AncsDiagnostics.running -> "Connecting…\n${AncsDiagnostics.status}"
+        else -> "Disconnected\nYour saved conversations are still available."
+    }
+    private fun showSettings() {
+        page("settings", "Settings")
+        button("Connection") { showConnection() }
+        button("Notification settings") {
+            startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+        }
+        label("Saved on this watch\nHistory stays until you clear its watch notification or clear it here. Clearing on iPhone keeps this history. No message-count limit or cloud backup.")
+        label("Notification log · 14 days\nA separate local log is kept for future history browsing.")
+        button("Clear all local data") {
+            AlertDialog.Builder(this).setTitle("Clear all local data?")
+                .setMessage("Deletes saved conversations and the 14-day notification log on this watch. Messages on your iPhone are unaffected.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Clear") { _, _ ->
+                    repository.whenReady {
+                        repository.history.snapshot().forEach { notifications.cancel(it.tag, 0) }
+                        repository.history.clear()
+                        repository.clearLog()
+                        repository.changed()
+                        repository.flush()
+                        showHome()
+                    }
+                }.show()
+        }
+        button("Diagnostics") { showDiagnostics() }
+        button("Back") { showHome() }
+    }
+    private fun showDiagnostics() {
+        page("diagnostics", "Diagnostics")
+        statusView = label(diagnosticsText(), 12f)
+        button("Back") { showSettings() }
+    }
+    private fun diagnosticsText() = "${AncsDiagnostics.status}\n\nReceived: ${AncsDiagnostics.received}\nPosted: ${AncsDiagnostics.posted}\nSaved cards: ${repository.history.cardCount}\n${repository.error ?: repository.logError ?: "Storage ready"}"
+
+    private fun connectSaved() = withPermissions {
+        val address = preferences.getString("phone", null)
+        if (address == null) showPhones() else {
+            startBridge(AncsBridgeService.ACTION_CONNECT, address)
+            showConnection()
+        }
+    }
+    @SuppressLint("MissingPermission")
+    private fun showPhones() {
+        page("phones", "Choose iPhone")
+        label("Select your iPhone from devices already paired with this watch.")
+        val adapter = getSystemService(BluetoothManager::class.java).adapter
+        if (adapter?.isEnabled != true) label("Turn on Bluetooth on the watch, then try again.")
+        else {
+            val devices = adapter.bondedDevices.sortedBy { it.name.orEmpty() }
+            if (devices.isEmpty()) label("No paired devices found.")
+            devices.forEach { device ->
+                button("${device.name ?: "Paired device"}\nPaired · ${device.address.takeLast(5)}") {
+                    startBridge(AncsBridgeService.ACTION_CONNECT, device.address)
+                    showConnection()
+                }
             }
         }
-        if (needed.isNotEmpty()) requestPermissions(needed.toTypedArray(), BLUETOOTH_PERMISSION_REQUEST)
-        else beginScan()
+        button("Back") { showConnection() }
     }
-
-    private fun beginScan() {
-        startBridgeService(AncsBridgeService.ACTION_SCAN)
-    }
-
-    private fun startBridgeService(action: String, fill: Intent.() -> Unit = {}) {
-        val intent = Intent(this, AncsBridgeService::class.java).setAction(action).apply(fill)
-        if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
-    }
-
-    override fun onSaveInstanceState(outState: Bundle) {
-        outState.putString("status", lastStatus)
-        super.onSaveInstanceState(outState)
-    }
-
-    private fun requestOrSend() {
-        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), PERMISSION_REQUEST)
-        } else {
-            sendNotification()
+    private fun withPermissions(action: () -> Unit) {
+        val missing = listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.POST_NOTIFICATIONS)
+            .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isEmpty()) action() else {
+            permissionAction = action
+            requestPermissions(missing.toTypedArray(), 11)
         }
     }
-
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == PERMISSION_REQUEST) {
-            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) sendNotification()
-            else updateStatus(getString(R.string.permission_denied))
-        } else if (requestCode == BLUETOOTH_PERMISSION_REQUEST) {
-            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) beginScan()
-            else bridgeStatus.text = getString(R.string.bluetooth_permissions_needed)
+        val action = permissionAction
+        permissionAction = null
+        if (requestCode == 11 && grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) action?.invoke()
+        else {
+            page("permission", "Permission needed")
+            label("Allow nearby devices and notifications to receive messages from your iPhone.")
+            button("App settings") { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:$packageName"))) }
+            button("Back") { showHome() }
         }
     }
-
-    private fun sendNotification() {
-        if (!notifications.areNotificationsEnabled()) {
-            updateStatus(getString(R.string.permission_denied))
-            return
-        }
-        if (notifications.getNotificationChannel(CHANNEL).importance == NotificationManager.IMPORTANCE_NONE) {
-            updateStatus(getString(R.string.channel_blocked))
-            return
-        }
-        val time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date())
-        val body = getString(R.string.notification_body, time)
-        val openApp = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val notification = NotificationCompat.Builder(this, CHANNEL)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(R.string.notification_title))
-            .setContentText(body)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
-            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            .setContentIntent(openApp)
-            .setAutoCancel(true)
-            .build()
-        notifications.notify(TEST_ID, notification)
-        updateStatus(getString(R.string.posted, time))
+    private fun startBridge(action: String, address: String? = null) {
+        startForegroundService(Intent(this, AncsBridgeService::class.java).setAction(action)
+            .apply { if (address != null) putExtra(AncsBridgeService.EXTRA_ADDRESS, address) })
     }
-
-    private fun sendGroupPreviewSample() {
-        if (!notifications.areNotificationsEnabled()) {
-            updateStatus(getString(R.string.permission_denied))
-            return
+    private fun navigateBack() {
+        when (screen) {
+            "home" -> finish()
+            "diagnostics" -> showSettings()
+            "phones" -> showConnection()
+            else -> showHome()
         }
-        val now = Instant.now()
-        val previews = ConversationPreviews()
-        val messages = listOf(
-            BridgeMessage("sample.chat", "weekend-plans", "Weekend plans", true, "Alex", "Anyone free Saturday?", now.minusSeconds(120)),
-            BridgeMessage("sample.chat", "weekend-plans", "Weekend plans", true, "Sam", "I can do the afternoon", now.minusSeconds(60)),
-            BridgeMessage("sample.chat", "weekend-plans", "Weekend plans", true, "Alex", "Great, let's meet at 2", now),
-        )
-        val preview = messages.mapNotNull(previews::add).last()
-        val openApp = PendingIntent.getActivity(this, GROUP_PREVIEW_ID,
-            Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        notifications.notify(GROUP_PREVIEW_ID, preview.buildNotification(
-            this, CHANNEL, R.drawable.ic_notification, openApp,
-        ))
-        updateStatus(getString(R.string.group_preview_posted))
     }
-
-    private fun updateStatus(message: String) {
-        lastStatus = message
-        status.text = message
+    private fun appName(app: String) = when (app) {
+        AncsConversationRules.MESSAGES -> "Messages"
+        AncsConversationRules.DISCORD -> "Discord"
+        "org.whispersystems.signal" -> "Signal"
+        else -> app
     }
-
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
-
-    companion object {
-        private const val CHANNEL = "test_messages"
-        private const val TEST_ID = 1
-        private const val GROUP_PREVIEW_ID = 2
-        private const val PERMISSION_REQUEST = 10
-        private const val BLUETOOTH_PERMISSION_REQUEST = 11
-    }
 }
